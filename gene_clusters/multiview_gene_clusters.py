@@ -1337,60 +1337,263 @@ def plot_cluster_views(
 
 
 # =============================================================================
-# 11. CLI
+# 11. CLUSTER ARCHETYPES
+# =============================================================================
+
+def _resolve_result_dir(result_dir: Optional[str]) -> str:
+    """
+    Resolve the result directory path.
+    If None, look for 'gene_clusters_results' next to this script file.
+    Raises FileNotFoundError if the directory does not exist.
+    """
+    if result_dir is not None:
+        p = os.path.abspath(result_dir)
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        p = os.path.join(script_dir, "gene_clusters_results")
+        logger.info(f"No --result-dir specified, looking for default: {p}")
+
+    if not os.path.isdir(p):
+        raise FileNotFoundError(
+            f"Result directory not found: {p}\n"
+            f"Run the 'cluster' subcommand first, or pass --result-dir explicitly."
+        )
+    return p
+
+
+def compute_cluster_archetypes(
+    result_dir: Optional[str] = None,
+) -> dict[str, dict[str, np.ndarray]]:
+    """
+    Compute cluster archetype embeddings for every view.
+
+    For each view and each cluster, the archetype is the mean of the spectral
+    embeddings of all genes assigned to that cluster:
+
+        archetype_c = (1 / |C|) * Σ_{g ∈ C} emb(g)
+
+    This gives a single vector per cluster that lives in the same spectral
+    space as the gene embeddings, enabling direct comparison (e.g., inter-
+    cluster distances, nearest-cluster lookup for new genes).
+
+    Reads from a previous pipeline run:
+        {result_dir}/cluster_gene_lists.json
+        {result_dir}/embeddings/gene_emb_{view}.pkl
+
+    Writes:
+        {result_dir}/embeddings/cluster_emb_{view}.pkl
+            dict[str, np.ndarray]  cluster_label → archetype vector
+
+    Parameters
+    ----------
+    result_dir : str, optional
+        Path to the pipeline output directory.
+        If None, defaults to 'gene_clusters_results' next to this script.
+
+    Returns
+    -------
+    dict[str, dict[str, np.ndarray]]
+        view_name → {cluster_label → archetype_vector}
+    """
+    result_dir = _resolve_result_dir(result_dir)
+
+    # --- Load cluster assignments ---
+    cluster_json_path = os.path.join(result_dir, "cluster_gene_lists.json")
+    if not os.path.exists(cluster_json_path):
+        raise FileNotFoundError(
+            f"cluster_gene_lists.json not found in {result_dir}. "
+            f"Run the 'cluster' subcommand first."
+        )
+
+    with open(cluster_json_path) as f:
+        cluster_gene_lists = json.load(f)  # {view: {cluster_label: [genes]}}
+
+    logger.info(f"Loaded cluster assignments for {len(cluster_gene_lists)} views from {cluster_json_path}")
+
+    emb_dir = os.path.join(result_dir, "embeddings")
+    if not os.path.isdir(emb_dir):
+        raise FileNotFoundError(
+            f"Embeddings directory not found: {emb_dir}. "
+            f"Run the 'cluster' subcommand first (gene embeddings are required)."
+        )
+
+    # --- Compute archetypes per view ---
+    all_archetypes = {}
+
+    for view_name, clusters in cluster_gene_lists.items():
+        emb_path = os.path.join(emb_dir, f"gene_emb_{view_name}.pkl")
+        if not os.path.exists(emb_path):
+            logger.warning(f"[{view_name}] Gene embeddings not found at {emb_path}, skipping")
+            continue
+
+        gene_emb = pickle_load(emb_path)  # dict[str, np.ndarray]
+        dim = next(iter(gene_emb.values())).shape[0]
+
+        archetypes = {}
+        for cluster_label, gene_list in clusters.items():
+            # Collect embeddings for genes in this cluster
+            vecs = []
+            missing = 0
+            for g in gene_list:
+                if g in gene_emb:
+                    vecs.append(gene_emb[g])
+                else:
+                    missing += 1
+
+            if not vecs:
+                logger.warning(
+                    f"[{view_name}] Cluster {cluster_label}: no gene embeddings found "
+                    f"({len(gene_list)} genes, all missing). Archetype set to zeros."
+                )
+                archetypes[cluster_label] = np.zeros(dim, dtype=np.float32)
+                continue
+
+            if missing > 0:
+                logger.warning(
+                    f"[{view_name}] Cluster {cluster_label}: {missing}/{len(gene_list)} "
+                    f"genes missing from embeddings, computing archetype from {len(vecs)} genes"
+                )
+
+            # Archetype = mean embedding
+            archetypes[cluster_label] = np.mean(vecs, axis=0).astype(np.float32)
+
+        # Save
+        out_path = os.path.join(emb_dir, f"cluster_emb_{view_name}.pkl")
+        pickle_save(archetypes, out_path)
+        all_archetypes[view_name] = archetypes
+
+        logger.info(
+            f"[{view_name}] Computed {len(archetypes)} cluster archetypes (dim={dim}) → {out_path}"
+        )
+
+    # --- Summary ---
+    logger.info("\nCluster Archetype Summary")
+    logger.info("=" * 40)
+    for view_name, archetypes in all_archetypes.items():
+        sizes = {k: len(cluster_gene_lists[view_name][k]) for k in archetypes}
+        logger.info(
+            f"  {view_name}: {len(archetypes)} archetypes, "
+            f"cluster sizes: {min(sizes.values())}–{max(sizes.values())} genes"
+        )
+
+    return all_archetypes
+
+
+# =============================================================================
+# 12. CLI
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-view gene clustering for single-cell inductive bias",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # ------------------------------------------------------------------
+    # Subcommand: cluster
+    # ------------------------------------------------------------------
+    p_cluster = subparsers.add_parser(
+        "cluster",
+        help="Run the full multi-view clustering pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Basic: annotation-based views only (no GPU needed, no imputation)
-  python multiview_gene_clusters.py --genes gene_list.txt --skip-esm --output clusters/
+  python multiview_gene_clusters.py cluster --genes gene_list.txt --skip-esm --output clusters/
 
   # Full: all views including ESM-2 on GPU + co-expression + imputation
-  python multiview_gene_clusters.py --genes gene_list.txt --adata data.h5ad \\
+  python multiview_gene_clusters.py cluster --genes gene_list.txt --adata data.h5ad \\
       --esm-device cuda --output clusters/
 
   # Tune resolution for more/fewer clusters
-  python multiview_gene_clusters.py --genes gene_list.txt --resolution 0.5 --output clusters/
+  python multiview_gene_clusters.py cluster --genes gene_list.txt --resolution 0.5 --output clusters/
         """,
     )
-    parser.add_argument("--genes", required=True, help="Path to text file with one gene symbol per line")
-    parser.add_argument("--output", default="gene_clusters", help="Output directory")
-    parser.add_argument("--adata", default=None, help="Path to .h5ad for co-expression view")
-    parser.add_argument("--esm-model", default="esm2_t33_650M_UR50D", help="ESM-2 model name")
-    parser.add_argument("--esm-device", default="cpu", choices=["cpu", "cuda"], help="Device for ESM-2")
-    parser.add_argument("--skip-esm", action="store_true", help="Skip ESM-2 view AND imputation")
-    parser.add_argument("--skip-coexpr", action="store_true", help="Skip co-expression view")
-    parser.add_argument("--k", type=int, default=15, help="kNN neighbors (default: 15)")
-    parser.add_argument("--resolution", type=float, default=1.0, help="Leiden resolution (default: 1.0)")
-    parser.add_argument("--k-transfer", type=int, default=15, help="kNN for ESM-2 annotation transfer (default: 15)")
-    parser.add_argument("--alpha-impute", type=float, default=0.7, help="ESM vs co-expression weight for imputation (default: 0.7)")
-    parser.add_argument("--cache", default=None, help="Cache directory for intermediate results")
+    p_cluster.add_argument("--genes", required=True, help="Path to text file with one gene symbol per line")
+    p_cluster.add_argument("--output", default="gene_clusters", help="Output directory")
+    p_cluster.add_argument("--adata", default=None, help="Path to .h5ad for co-expression view")
+    p_cluster.add_argument("--esm-model", default="esm2_t33_650M_UR50D", help="ESM-2 model name")
+    p_cluster.add_argument("--esm-device", default="cpu", choices=["cpu", "cuda"], help="Device for ESM-2")
+    p_cluster.add_argument("--skip-esm", action="store_true", help="Skip ESM-2 view AND imputation")
+    p_cluster.add_argument("--skip-coexpr", action="store_true", help="Skip co-expression view")
+    p_cluster.add_argument("--k", type=int, default=15, help="kNN neighbors (default: 15)")
+    p_cluster.add_argument("--resolution", type=float, default=1.0, help="Leiden resolution (default: 1.0)")
+    p_cluster.add_argument("--k-transfer", type=int, default=10, help="kNN for ESM-2 annotation transfer (default: 10)")
+    p_cluster.add_argument("--alpha-impute", type=float, default=0.7, help="ESM vs co-expression weight for imputation (default: 0.7)")
+    p_cluster.add_argument("--cache", default=None, help="Cache directory for intermediate results")
 
+    # ------------------------------------------------------------------
+    # Subcommand: archetypes
+    # ------------------------------------------------------------------
+    p_arch = subparsers.add_parser(
+        "archetypes",
+        help="Compute cluster archetype embeddings from a previous clustering run",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Computes the mean gene embedding (archetype) for each cluster in each view.
+Reads gene embeddings and cluster assignments from a previous 'cluster' run.
+
+Examples:
+  # Use explicit result directory
+  python multiview_gene_clusters.py archetypes --result-dir gene_clusters/
+
+  # Auto-detect: looks for 'gene_clusters_results/' next to the script
+  python multiview_gene_clusters.py archetypes
+        """,
+    )
+    p_arch.add_argument(
+        "--result-dir", default=None,
+        help="Path to pipeline output directory (default: 'gene_clusters_results' next to this script)",
+    )
+
+    # ------------------------------------------------------------------
+    # Parse & dispatch
+    # ------------------------------------------------------------------
     args = parser.parse_args()
 
-    with open(args.genes) as f:
-        genes = [line.strip() for line in f if line.strip()]
-    logger.info(f"Loaded {len(genes)} genes from {args.genes}")
+    if args.command is None:
+        parser.print_help()
+        return
 
-    run_multiview_clustering(
-        genes=genes,
-        output_dir=args.output,
-        adata_path=args.adata,
-        esm_model=args.esm_model,
-        esm_device=args.esm_device,
-        skip_esm=args.skip_esm,
-        skip_coexpr=args.skip_coexpr,
-        k=args.k,
-        resolution=args.resolution,
-        k_transfer=args.k_transfer,
-        alpha_impute=args.alpha_impute,
-        cache_dir=args.cache,
-    )
+    if args.command == "cluster":
+        with open(args.genes) as f:
+            genes = [line.strip() for line in f if line.strip()]
+        logger.info(f"Loaded {len(genes)} genes from {args.genes}")
+
+        run_multiview_clustering(
+            genes=genes,
+            output_dir=args.output,
+            adata_path=args.adata,
+            esm_model=args.esm_model,
+            esm_device=args.esm_device,
+            skip_esm=args.skip_esm,
+            skip_coexpr=args.skip_coexpr,
+            k=args.k,
+            resolution=args.resolution,
+            k_transfer=args.k_transfer,
+            alpha_impute=args.alpha_impute,
+            cache_dir=args.cache,
+        )
+
+    elif args.command == "archetypes":
+        compute_cluster_archetypes(result_dir=args.result_dir)
 
 
 if __name__ == "__main__":
-    main()
+  """
+  # Full pipeline (unchanged behavior)
+  !python multiview_gene_clusters.py cluster \
+      --genes $PATH_GENE_LIST \
+      --adata $PATH_DATA_H5AD \
+      --esm-device cuda \
+      --cache $PATH_CACHE \
+      --output $PATH_OUTPUT
+
+  # Compute archetypes from a previous run
+  !python multiview_gene_clusters.py archetypes --result-dir $PATH_OUTPUT
+
+  # Auto-detect: looks for gene_clusters_results/ next to the script
+  !python multiview_gene_clusters.py archetypes
+  """
+  main()
