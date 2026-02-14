@@ -1,5 +1,5 @@
 # Core (always needed)
-msigdbr>=0.1.0
+gseapy
 pandas>=1.5
 numpy>=1.24
 scipy>=1.10

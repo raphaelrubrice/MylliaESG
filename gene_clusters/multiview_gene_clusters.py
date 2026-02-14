@@ -52,42 +52,46 @@ logger = logging.getLogger(__name__)
 
 def fetch_msigdb_gene_sets(
     collection: str,
-    subcollection: Optional[str] = None,
-    species: str = "Homo sapiens",
+    subcollection: str = None,
+    species: str = "Human", # gseapy uses "Human", "Mouse", etc.
+    version: str = "2023.2.Hs" # Specific version is often safer
 ) -> dict[str, set[str]]:
     """
-    Fetch gene sets from MSigDB via the msigdbr Python package.
-
-    Parameters
-    ----------
-    collection : str
-        MSigDB collection, e.g. "C2", "C5", "H".
-    subcollection : str, optional
-        MSigDB sub-collection, e.g. "CP:REACTOME", "GO:BP", "GO:CC", "GO:MF".
-    species : str
-        Species name. Default "Homo sapiens".
-
-    Returns
-    -------
-    dict[str, set[str]]
-        Mapping from gene-set name → set of gene symbols.
+    Fetch gene sets from MSigDB via gseapy.
+    
+    Mapping notes:
+    - collection='C2', subcollection='CP:REACTOME' -> category='c2.cp.reactome'
+    - collection='H' -> category='h.all'
     """
-    import msigdbr
-
-    kwargs = {"species": species, "collection": collection}
+    import gseapy as gp
+    # Construct the gseapy category string
+    # gseapy expects formats like 'c2.cp.reactome' or 'h.all'
+    category_parts = [collection.lower()]
     if subcollection:
-        kwargs["subcollection"] = subcollection
-
-    df = msigdbr.msigdbr(**kwargs)
-    gene_sets = defaultdict(set)
-    for _, row in df.iterrows():
-        gene_sets[row["gs_name"]].add(row["gene_symbol"])
-
-    logger.info(
-        f"Fetched {len(gene_sets)} gene sets from MSigDB "
-        f"{collection}/{subcollection or ''} ({sum(len(v) for v in gene_sets.values())} gene-set memberships)"
-    )
-    return dict(gene_sets)
+        # Clean up common R-style formatting (e.g., "CP:REACTOME" -> "cp.reactome")
+        clean_sub = subcollection.lower().replace(":", ".")
+        category_parts.append(clean_sub)
+    else:
+        # If it's a main collection like H or C1 without sub, usually append '.all'
+        category_parts.append("all")
+        
+    category_name = ".".join(category_parts)
+    
+    try:
+        # gseapy.get_library_name() can verify names, but get_gmt is direct
+        # Note: gseapy often caches these downloads locally
+        msig = gp.Msigdb() 
+        gmt_dict = msig.get_gmt(category=category_name, dbver=version)
+        
+        # Convert list of genes to sets as requested
+        gene_sets = {name: set(genes) for name, genes in gmt_dict.items()}
+        
+        logger.info(f"Fetched {len(gene_sets)} gene sets for {category_name}")
+        return gene_sets
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch {category_name}: {e}")
+        return {}
 
 
 # =============================================================================
