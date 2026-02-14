@@ -12,16 +12,28 @@ Given a list of human gene symbols, this module produces multiple hard partition
   View 5 — ESM-2 Protein Embeddings: functional similarity via PLM embeddings
   View 6 — Co-expression (optional): gene-gene correlation from your own data
 
-The pipeline is always the same per view:
-  gene list → gene×gene similarity matrix → kNN graph → Leiden clustering → cluster labels
+Pipeline per annotation view (Views 1-4):
+  gene list → gene×gene co-membership matrix
+            → impute residual genes via ESM-2 kNN transfer (+co-expression)
+            → kNN graph → Leiden clustering → cluster labels
+            → spectral embedding (complete vocabulary, all genes)
+
+Pipeline order:
+  ESM-2 raw embeddings (needed as transfer source)
+  → Co-expression similarity (secondary transfer source)
+  → Annotation views (with imputation before clustering)
+  → ESM-2 view (direct similarity, no imputation)
+  → Co-expression view (direct similarity, no imputation)
 
 Usage:
   python multiview_gene_clusters.py --genes gene_list.txt --output clusters/
   python multiview_gene_clusters.py --genes gene_list.txt --adata my_data.h5ad --output clusters/
 
 Requirements:
-  pip install msigdbr pandas numpy scipy igraph leidenalg scanpy anndata
-  pip install fair-esm torch   # only for ESM-2 view (View 5)
+  Core:     pip install gseapy pandas numpy scipy igraph leidenalg scikit-learn
+  ESM-2:    pip install fair-esm torch mygene requests
+  CoExpr:   pip install scanpy anndata
+  Plotting: pip install umap-learn matplotlib
 
 Author: Generated for single-cell gene-space modeling
 """
@@ -30,7 +42,7 @@ import argparse
 import json
 import logging
 import os
-import pickle
+import pickle as pkl
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -53,42 +65,34 @@ logger = logging.getLogger(__name__)
 def fetch_msigdb_gene_sets(
     collection: str,
     subcollection: str = None,
-    species: str = "Human", # gseapy uses "Human", "Mouse", etc.
-    version: str = "2023.2.Hs" # Specific version is often safer
+    species: str = "Human",
+    version: str = "2023.2.Hs",
 ) -> dict[str, set[str]]:
     """
     Fetch gene sets from MSigDB via gseapy.
-    
+
     Mapping notes:
     - collection='C2', subcollection='CP:REACTOME' -> category='c2.cp.reactome'
     - collection='H' -> category='h.all'
     """
     import gseapy as gp
-    # Construct the gseapy category string
-    # gseapy expects formats like 'c2.cp.reactome' or 'h.all'
+
     category_parts = [collection.lower()]
     if subcollection:
-        # Clean up common R-style formatting (e.g., "CP:REACTOME" -> "cp.reactome")
         clean_sub = subcollection.lower().replace(":", ".")
         category_parts.append(clean_sub)
     else:
-        # If it's a main collection like H or C1 without sub, usually append '.all'
         category_parts.append("all")
-        
+
     category_name = ".".join(category_parts)
-    
+
     try:
-        # gseapy.get_library_name() can verify names, but get_gmt is direct
-        # Note: gseapy often caches these downloads locally
-        msig = gp.Msigdb() 
+        msig = gp.Msigdb()
         gmt_dict = msig.get_gmt(category=category_name, dbver=version)
-        
-        # Convert list of genes to sets as requested
         gene_sets = {name: set(genes) for name, genes in gmt_dict.items()}
-        
         logger.info(f"Fetched {len(gene_sets)} gene sets for {category_name}")
         return gene_sets
-        
+
     except Exception as e:
         logger.error(f"Failed to fetch {category_name}: {e}")
         return {}
@@ -105,30 +109,17 @@ def build_comembership_matrix(
     max_set_size: int = 500,
 ) -> np.ndarray:
     """
-    Build a gene×gene similarity matrix where similarity(i, j) = number of
-    gene sets in which both gene i and gene j appear (Jaccard-like co-membership).
-
-    We then normalize by dividing by the geometric mean of each gene's total
-    membership count, yielding a value in [0, 1] (cosine-like normalization).
-
-    Parameters
-    ----------
-    genes : list[str]
-        Ordered list of gene symbols (defines rows/cols of the matrix).
-    gene_sets : dict[str, set[str]]
-        Gene-set name → set of member gene symbols.
-    min_set_size, max_set_size : int
-        Filter gene sets by size (after intersecting with `genes`).
+    Build a gene×gene similarity matrix from co-membership in gene sets.
+    Normalized by geometric mean of membership counts (cosine-like).
 
     Returns
     -------
     np.ndarray
-        (n_genes, n_genes) similarity matrix, float32.
+        (n_genes, n_genes) similarity matrix, float32. Diagonal is 0.
     """
     gene_to_idx = {g: i for i, g in enumerate(genes)}
     n = len(genes)
 
-    # Build binary gene × gene_set membership matrix
     filtered_sets = []
     for name, members in gene_sets.items():
         overlap = members & set(genes)
@@ -138,10 +129,9 @@ def build_comembership_matrix(
     logger.info(f"Using {len(filtered_sets)} gene sets after size filtering [{min_set_size}, {max_set_size}]")
 
     if len(filtered_sets) == 0:
-        logger.warning("No gene sets passed filtering! Returning identity matrix.")
-        return np.eye(n, dtype=np.float32)
+        logger.warning("No gene sets passed filtering! Returning zero matrix.")
+        return np.zeros((n, n), dtype=np.float32)
 
-    # Build sparse binary membership matrix: genes × gene_sets
     rows, cols = [], []
     for j, members in enumerate(filtered_sets):
         for g in members:
@@ -154,16 +144,13 @@ def build_comembership_matrix(
         shape=(n, len(filtered_sets)),
     )
 
-    # Co-membership = M @ M.T  (counts how many sets each pair shares)
     co_mem = (M @ M.T).toarray().astype(np.float32)
 
-    # Normalize: divide by geometric mean of diagonal (each gene's total count)
     diag = np.diag(co_mem).copy()
-    diag[diag == 0] = 1.0  # avoid division by zero
+    diag[diag == 0] = 1.0
     norm = np.sqrt(np.outer(diag, diag))
     sim = co_mem / norm
 
-    # Zero out self-similarity for cleanliness (will be handled by graph construction)
     np.fill_diagonal(sim, 0.0)
 
     n_annotated = int(np.sum(np.diag(co_mem) > 0))
@@ -178,10 +165,11 @@ def build_comembership_matrix(
 
 def fetch_protein_sequences(genes: list[str]) -> dict[str, str]:
     """
-    Fetch canonical protein sequences for human genes from UniProt via the
-    mygene.info API (no authentication needed).
+    Fetch canonical protein sequences for human genes via:
+      1. mygene.info → UniProt accessions (Swiss-Prot preferred, TrEMBL fallback)
+      2. UniProt REST API v2 → FASTA sequences
 
-    Falls back gracefully for genes without a UniProt mapping.
+    Handles ENSG-style names, aliases, and readthrough genes.
 
     Returns
     -------
@@ -189,69 +177,117 @@ def fetch_protein_sequences(genes: list[str]) -> dict[str, str]:
         gene_symbol → amino acid sequence.
     """
     import mygene
+    import requests
+    from time import sleep
 
     mg = mygene.MyGeneInfo()
     logger.info(f"Querying mygene.info for UniProt IDs of {len(genes)} genes...")
+
+    # --- Step 1: Gene symbols → UniProt accessions ---
+    # Use broad scopes: symbol, alias, and Ensembl gene ID (for ENSG names)
     results = mg.querymany(
         genes,
-        scopes="symbol",
-        fields="uniprot.Swiss-Prot,symbol",
+        scopes="symbol,alias,ensembl.gene",
+        fields="uniprot.Swiss-Prot,uniprot.TrEMBL,symbol",
         species="human",
         returnall=True,
     )
 
-    # Collect UniProt IDs
     symbol_to_uniprot = {}
     for hit in results["out"]:
         symbol = hit.get("query", "")
+        if hit.get("notfound", False):
+            continue
         up = hit.get("uniprot", {})
+        if not up:
+            continue
+        # Prefer Swiss-Prot (reviewed), fall back to TrEMBL (unreviewed)
         sp = up.get("Swiss-Prot", None)
+        if sp is None:
+            sp = up.get("TrEMBL", None)
         if sp:
             if isinstance(sp, list):
-                sp = sp[0]
+                sp = sp[0]  # take canonical / first entry
             symbol_to_uniprot[symbol] = sp
 
-    logger.info(f"Found UniProt IDs for {len(symbol_to_uniprot)}/{len(genes)} genes")
+    n_found = len(symbol_to_uniprot)
+    n_missing = len(genes) - n_found
+    logger.info(f"Found UniProt IDs for {n_found}/{len(genes)} genes ({n_missing} unmapped)")
 
-    # Fetch sequences from UniProt in batches
-    import urllib.request
+    if n_found == 0:
+        return {}
 
-    sequences = {}
-    uniprot_ids = list(symbol_to_uniprot.items())
-    batch_size = 200
+    # --- Step 2: UniProt accessions → FASTA sequences ---
+    # Use the correct UniProt REST API v2 query syntax:
+    #   query=accession:P12345 OR accession:P67890
+    # Smaller batches (50) to stay within URL length limits.
+    sequences = {}  # accession → sequence
+    uniprot_items = list(symbol_to_uniprot.items())
+    batch_size = 50
+    max_retries = 3
 
-    for i in range(0, len(uniprot_ids), batch_size):
-        batch = uniprot_ids[i : i + batch_size]
-        ids_str = ",".join(uid for _, uid in batch)
-        url = f"https://rest.uniprot.org/uniprotkb/stream?query=accession:({ids_str})&format=fasta"
-        try:
-            with urllib.request.urlopen(url, timeout=60) as resp:
-                fasta = resp.read().decode("utf-8")
-            # Parse FASTA
-            current_id = None
-            current_seq = []
-            for line in fasta.split("\n"):
-                if line.startswith(">"):
-                    if current_id and current_seq:
-                        sequences[current_id] = "".join(current_seq)
-                    # Extract accession from >sp|P12345|NAME_HUMAN ...
-                    parts = line.split("|")
-                    current_id = parts[1] if len(parts) >= 2 else line[1:].split()[0]
-                    current_seq = []
+    for i in range(0, len(uniprot_items), batch_size):
+        batch = uniprot_items[i : i + batch_size]
+        accessions = [uid for _, uid in batch]
+
+        # Build query: "accession:X OR accession:Y OR ..."
+        query = " OR ".join(f"accession:{uid}" for uid in accessions)
+
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(
+                    "https://rest.uniprot.org/uniprotkb/stream",
+                    params={"format": "fasta", "query": query},
+                    headers={"Accept": "text/plain"},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                fasta_text = resp.text
+
+                # Parse FASTA
+                current_id = None
+                current_seq = []
+                for line in fasta_text.split("\n"):
+                    if line.startswith(">"):
+                        if current_id and current_seq:
+                            sequences[current_id] = "".join(current_seq)
+                        # >sp|P12345|NAME_HUMAN ... or >tr|A0A0G2JRW2|...
+                        parts = line.split("|")
+                        current_id = parts[1] if len(parts) >= 2 else line[1:].split()[0]
+                        current_seq = []
+                    elif line.strip():
+                        current_seq.append(line.strip())
+                if current_id and current_seq:
+                    sequences[current_id] = "".join(current_seq)
+                break  # success
+
+            except requests.exceptions.HTTPError as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"UniProt batch {i} HTTP error (attempt {attempt+1}), retrying in {wait}s: {e}")
+                    sleep(wait)
                 else:
-                    current_seq.append(line.strip())
-            if current_id and current_seq:
-                sequences[current_id] = "".join(current_seq)
-        except Exception as e:
-            logger.warning(f"Failed to fetch batch {i}: {e}")
+                    logger.warning(f"UniProt batch {i} failed after {max_retries} attempts: {e}")
+            except Exception as e:
+                logger.warning(f"UniProt batch {i} unexpected error: {e}")
+                break
 
-    # Map back to gene symbols
+        if (i // batch_size) % 10 == 0:
+            n_so_far = len(sequences)
+            logger.info(f"  UniProt fetch progress: {min(i + batch_size, len(uniprot_items))}/{len(uniprot_items)} queries, {n_so_far} sequences retrieved")
+
+    # --- Step 3: Map accessions back to gene symbols ---
     symbol_to_seq = {}
     for symbol, uid in symbol_to_uniprot.items():
         if uid in sequences:
             symbol_to_seq[symbol] = sequences[uid]
 
     logger.info(f"Retrieved protein sequences for {len(symbol_to_seq)}/{len(genes)} genes")
+
+    if len(symbol_to_seq) < n_found:
+        n_seq_missing = n_found - len(symbol_to_seq)
+        logger.info(f"  {n_seq_missing} genes had UniProt IDs but no sequence returned (obsolete/merged entries)")
+
     return symbol_to_seq
 
 
@@ -264,23 +300,16 @@ def compute_esm2_embeddings(
     """
     Compute ESM-2 mean-pooled embeddings for each gene's protein sequence.
 
-    Parameters
-    ----------
-    gene_sequences : dict[str, str]
-        gene_symbol → amino acid sequence.
-    model_name : str
-        ESM-2 model variant. Smaller: "esm2_t6_8M_UR50D", "esm2_t12_35M_UR50D".
-        Larger/better: "esm2_t33_650M_UR50D" (default), "esm2_t36_3B_UR50D".
-    device : str
-        "cpu" or "cuda".
-    max_length : int
-        Truncate sequences longer than this.
-
     Returns
     -------
     dict[str, np.ndarray]
         gene_symbol → 1D embedding vector (float32).
+        Empty dict if no sequences provided.
     """
+    if not gene_sequences:
+        logger.warning("No protein sequences provided, returning empty embeddings dict")
+        return {}
+
     import torch
     import esm
 
@@ -291,11 +320,10 @@ def compute_esm2_embeddings(
 
     embeddings = {}
     gene_list = list(gene_sequences.items())
-    batch_size = 8  # adjust based on GPU memory
+    batch_size = 8
 
     for i in range(0, len(gene_list), batch_size):
         batch_raw = gene_list[i : i + batch_size]
-        # Truncate sequences
         batch_data = [(name, seq[:max_length]) for name, seq in batch_raw]
 
         _, _, batch_tokens = batch_converter(batch_data)
@@ -304,10 +332,9 @@ def compute_esm2_embeddings(
         with torch.no_grad():
             results = model(batch_tokens, repr_layers=[model.num_layers], return_contacts=False)
 
-        token_reprs = results["representations"][model.num_layers]  # (B, L, D)
+        token_reprs = results["representations"][model.num_layers]
 
         for j, (name, seq) in enumerate(batch_data):
-            # Mean-pool over actual residue tokens (skip BOS/EOS)
             seq_len = len(seq)
             emb = token_reprs[j, 1 : seq_len + 1, :].mean(dim=0).cpu().numpy()
             embeddings[name] = emb.astype(np.float32)
@@ -315,7 +342,12 @@ def compute_esm2_embeddings(
         if (i // batch_size) % 50 == 0:
             logger.info(f"  ESM-2 progress: {min(i + batch_size, len(gene_list))}/{len(gene_list)}")
 
-    logger.info(f"Computed ESM-2 embeddings for {len(embeddings)} genes (dim={list(embeddings.values())[0].shape[0]})")
+    if embeddings:
+        dim = next(iter(embeddings.values())).shape[0]
+        logger.info(f"Computed ESM-2 embeddings for {len(embeddings)} genes (dim={dim})")
+    else:
+        logger.warning("ESM-2 produced no embeddings")
+
     return embeddings
 
 
@@ -328,6 +360,10 @@ def build_esm_similarity_matrix(
     Genes without embeddings get zero similarity to all others.
     """
     n = len(genes)
+    if not embeddings:
+        logger.warning("No ESM-2 embeddings available, returning zero similarity matrix")
+        return np.zeros((n, n), dtype=np.float32)
+
     dim = next(iter(embeddings.values())).shape[0]
 
     mat = np.zeros((n, dim), dtype=np.float32)
@@ -338,7 +374,6 @@ def build_esm_similarity_matrix(
             mat[i] = embeddings[g]
             has_emb[i] = True
 
-    # L2 normalize for cosine similarity
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     mat_normed = mat / norms
@@ -346,7 +381,6 @@ def build_esm_similarity_matrix(
     sim = mat_normed @ mat_normed.T
     np.fill_diagonal(sim, 0.0)
 
-    # Zero out rows/cols for genes without embeddings
     sim[~has_emb, :] = 0.0
     sim[:, ~has_emb] = 0.0
 
@@ -365,20 +399,7 @@ def build_coexpression_similarity(
 ) -> np.ndarray:
     """
     Build gene-gene Spearman correlation matrix from an AnnData object.
-
-    Parameters
-    ----------
-    genes : list[str]
-        Gene symbols to include.
-    adata_path : str
-        Path to .h5ad file.
-    n_top_corr : int
-        Keep only the top-n correlations per gene (sparsify).
-
-    Returns
-    -------
-    np.ndarray
-        (n_genes, n_genes) correlation-based similarity matrix.
+    Uses absolute correlation as similarity (anti-correlated genes are also related).
     """
     import anndata
     import scanpy as sc
@@ -386,7 +407,6 @@ def build_coexpression_similarity(
     logger.info(f"Loading AnnData from {adata_path}...")
     adata = anndata.read_h5ad(adata_path)
 
-    # Subset to requested genes
     available = [g for g in genes if g in adata.var_names]
     missing = set(genes) - set(available)
     if missing:
@@ -394,7 +414,6 @@ def build_coexpression_similarity(
 
     adata_sub = adata[:, available]
 
-    # Get expression matrix (dense, log-normalized assumed)
     if sparse.issparse(adata_sub.X):
         X = adata_sub.X.toarray()
     else:
@@ -402,26 +421,20 @@ def build_coexpression_similarity(
 
     logger.info(f"Computing gene-gene Spearman correlation for {X.shape[1]} genes across {X.shape[0]} cells...")
 
-    # For large matrices, use numpy correlation on ranks
     from scipy.stats import rankdata
 
-    # Rank per column (gene) across cells
     X_ranked = np.apply_along_axis(rankdata, 0, X).astype(np.float32)
-
-    # Pearson correlation on ranked data = Spearman
     X_ranked -= X_ranked.mean(axis=0, keepdims=True)
     norms = np.linalg.norm(X_ranked, axis=0, keepdims=True)
     norms[norms == 0] = 1.0
     X_ranked /= norms
 
-    corr = X_ranked.T @ X_ranked / X_ranked.shape[0]  # not exact but close enough
+    corr = X_ranked.T @ X_ranked / X_ranked.shape[0]
     corr = np.clip(corr, -1, 1)
 
-    # Use absolute correlation as similarity (anti-correlated genes are also related)
     sim_sub = np.abs(corr).astype(np.float32)
     np.fill_diagonal(sim_sub, 0.0)
 
-    # Map back to full gene list
     gene_to_idx_sub = {g: i for i, g in enumerate(available)}
     n = len(genes)
     sim = np.zeros((n, n), dtype=np.float32)
@@ -435,7 +448,154 @@ def build_coexpression_similarity(
 
 
 # =============================================================================
-# 5. GRAPH CONSTRUCTION + LEIDEN CLUSTERING
+# 5. IMPUTE RESIDUAL GENES VIA ESM-2 kNN ANNOTATION TRANSFER
+# =============================================================================
+
+def impute_residual_features(
+    sim: np.ndarray,
+    genes: list[str],
+    esm_embeddings: dict[str, np.ndarray],
+    k_transfer: int = 10,
+    coexpr_sim: Optional[np.ndarray] = None,
+    alpha: float = 0.7,
+    view_name: str = "unnamed",
+) -> np.ndarray:
+    """
+    For genes with zero similarity rows (unannotated in this view),
+    impute a pseudo-similarity row via kNN transfer from ESM-2 embedding
+    space, optionally blended with co-expression neighbors.
+
+    Principled basis: the GoPredSim paradigm (Littmann et al., 2021) —
+    PLM embeddings implicitly encode GO-relevant functional information
+    even though they were never trained on GO terms. We exploit this by
+    transferring annotation-based similarity profiles from the k nearest
+    annotated genes in ESM-2 space.
+
+    For each residual gene g with an ESM-2 embedding:
+      1. Find k nearest ANNOTATED genes in ESM-2 cosine space
+      2. pseudo_sim[g, :] = weighted avg of neighbors' similarity rows
+         (weights = ESM cosine similarity to g, softmax-normalized)
+      3. Optionally blend with co-expression kNN transfer (weight 1-α)
+
+    Parameters
+    ----------
+    sim : np.ndarray
+        (n, n) similarity matrix (annotation-based, e.g., Reactome).
+    genes : list[str]
+        Gene symbols.
+    esm_embeddings : dict[str, np.ndarray]
+        gene → ESM-2 mean-pooled embedding (raw PLM output).
+    k_transfer : int
+        Number of annotated neighbors to transfer from.
+    coexpr_sim : np.ndarray, optional
+        (n, n) co-expression similarity matrix (secondary transfer source).
+    alpha : float
+        Weight on ESM-2 transfer vs co-expression transfer (1.0 = ESM only).
+    view_name : str
+        For logging.
+
+    Returns
+    -------
+    np.ndarray
+        Augmented similarity matrix with imputed rows for residual genes.
+    """
+    n = len(genes)
+    has_annotation = np.any(sim > 0, axis=1)
+    annotated_idx = np.where(has_annotation)[0]
+    residual_idx = np.where(~has_annotation)[0]
+
+    if len(residual_idx) == 0:
+        logger.info(f"[{view_name}] No residual genes to impute")
+        return sim
+
+    if len(annotated_idx) == 0:
+        logger.warning(f"[{view_name}] No annotated genes available for imputation")
+        return sim
+
+    # Build ESM embedding matrix
+    esm_dim = next(iter(esm_embeddings.values())).shape[0] if esm_embeddings else 0
+    if esm_dim == 0:
+        logger.warning(f"[{view_name}] No ESM-2 embeddings available, skipping imputation")
+        return sim
+
+    esm_mat = np.zeros((n, esm_dim), dtype=np.float32)
+    has_esm = np.zeros(n, dtype=bool)
+    for i, g in enumerate(genes):
+        if g in esm_embeddings:
+            esm_mat[i] = esm_embeddings[g]
+            has_esm[i] = True
+
+    # L2-normalize for cosine similarity
+    norms = np.linalg.norm(esm_mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    esm_normed = esm_mat / norms
+
+    sim_augmented = sim.copy()
+
+    # Only impute residual genes that have ESM-2 embeddings
+    imputable_idx = np.where(has_esm & ~has_annotation)[0]
+
+    # Annotated genes that also have ESM embeddings (transfer sources)
+    source_idx = np.where(has_esm & has_annotation)[0]
+
+    if len(source_idx) == 0:
+        logger.warning(f"[{view_name}] No annotated genes have ESM-2 embeddings, cannot impute")
+        return sim
+
+    # Pre-compute ESM cosine similarities: imputable × source
+    cos_matrix = None
+    if len(imputable_idx) > 0:
+        cos_matrix = esm_normed[imputable_idx] @ esm_normed[source_idx].T  # (n_imp, n_src)
+
+    n_imputed = 0
+    for local_i, res_i in enumerate(imputable_idx):
+        cos_sims = cos_matrix[local_i]
+        k_eff = min(k_transfer, len(source_idx))
+        top_k_local = np.argsort(cos_sims)[-k_eff:]
+
+        # Softmax-like weights from cosine similarities (clamp negatives)
+        top_sims = np.clip(cos_sims[top_k_local], 0, None)
+        weight_sum = top_sims.sum()
+        if weight_sum < 1e-8:
+            continue  # no positive similarity to any annotated gene
+        weights = top_sims / weight_sum
+
+        # Weighted average of annotated neighbors' similarity rows
+        neighbor_global_idx = source_idx[top_k_local]
+        pseudo_row = np.zeros(n, dtype=np.float32)
+        for w, ni in zip(weights, neighbor_global_idx):
+            pseudo_row += w * sim[ni]
+
+        # --- Optional: blend with co-expression transfer ---
+        if coexpr_sim is not None and alpha < 1.0:
+            coexpr_to_annotated = coexpr_sim[res_i, annotated_idx]
+            k_eff_c = min(k_transfer, len(annotated_idx))
+            top_k_c = np.argsort(coexpr_to_annotated)[-k_eff_c:]
+
+            top_c_sims = np.clip(coexpr_to_annotated[top_k_c], 0, None)
+            c_sum = top_c_sims.sum()
+            if c_sum > 1e-8:
+                weights_c = top_c_sims / c_sum
+                pseudo_row_c = np.zeros(n, dtype=np.float32)
+                for w, ci in zip(weights_c, annotated_idx[top_k_c]):
+                    pseudo_row_c += w * sim[ci]
+                pseudo_row = alpha * pseudo_row + (1 - alpha) * pseudo_row_c
+
+        pseudo_row[res_i] = 0.0  # no self-similarity
+        sim_augmented[res_i] = pseudo_row
+        sim_augmented[:, res_i] = pseudo_row  # symmetrize
+        n_imputed += 1
+
+    n_still_residual = len(residual_idx) - n_imputed
+    logger.info(
+        f"[{view_name}] Imputed {n_imputed}/{len(residual_idx)} residual genes via ESM-2 kNN transfer"
+        f" ({n_still_residual} remain truly dark — no ESM embedding)"
+    )
+    return sim_augmented
+
+
+# =============================================================================
+# 6. GRAPH CONSTRUCTION + LEIDEN CLUSTERING
 # =============================================================================
 
 def similarity_to_leiden_clusters(
@@ -453,73 +613,48 @@ def similarity_to_leiden_clusters(
       1. Build mutual kNN graph from the similarity matrix.
       2. Run Leiden community detection.
       3. Assign orphan genes (0 similarity) to a residual cluster.
-
-    Parameters
-    ----------
-    sim : np.ndarray
-        (n, n) similarity matrix.
-    genes : list[str]
-        Gene symbols.
-    k : int
-        Number of nearest neighbors for graph construction.
-    resolution : float
-        Leiden resolution parameter (higher = more clusters).
-    min_cluster_size : int
-        Merge clusters smaller than this into the nearest larger cluster.
-    view_name : str
-        Label for this view.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: ["gene", "cluster", "view"]
     """
     import igraph as ig
     import leidenalg
 
     n = len(genes)
 
-    # Identify genes with zero similarity (unannotated in this view)
     has_signal = np.any(sim > 0, axis=1)
     annotated_idx = np.where(has_signal)[0]
     unannotated_idx = np.where(~has_signal)[0]
 
     logger.info(
-        f"[{view_name}] {len(annotated_idx)} annotated genes, "
-        f"{len(unannotated_idx)} unannotated (will be residual cluster)"
+        f"[{view_name}] {len(annotated_idx)} genes with signal, "
+        f"{len(unannotated_idx)} truly dark (residual cluster)"
     )
 
     if len(annotated_idx) < 10:
-        logger.warning(f"[{view_name}] Too few annotated genes for clustering, assigning all to cluster 0")
+        logger.warning(f"[{view_name}] Too few genes with signal for clustering, assigning all to cluster 0")
         return pd.DataFrame({
             "gene": genes,
             "cluster": [f"{view_name}_0"] * n,
             "view": view_name,
         })
 
-    # Subset similarity to annotated genes
     sim_sub = sim[np.ix_(annotated_idx, annotated_idx)]
 
-    # Build kNN graph
     k_eff = min(k, len(annotated_idx) - 1)
     edges = []
     weights = []
 
     for i in range(len(annotated_idx)):
         row = sim_sub[i].copy()
-        row[i] = -1  # exclude self
+        row[i] = -1
         top_k = np.argsort(row)[-k_eff:]
         for j in top_k:
             if row[j] > 0:
                 edges.append((i, j))
                 weights.append(float(row[j]))
 
-    # Create igraph graph
     g = ig.Graph(n=len(annotated_idx), edges=edges, directed=False)
     g.es["weight"] = weights
     g.simplify(combine_edges="max")
 
-    # Leiden clustering
     partition = leidenalg.find_partition(
         g,
         leidenalg.RBConfigurationVertexPartition,
@@ -537,7 +672,6 @@ def similarity_to_leiden_clusters(
     if small_clusters:
         large_clusters = cluster_counts[cluster_counts >= min_cluster_size].index.tolist()
         if large_clusters:
-            # For each small cluster, find the large cluster most similar to it
             for sc in small_clusters:
                 sc_genes_idx = np.where(cluster_labels_sub == sc)[0]
                 best_target = large_clusters[0]
@@ -550,7 +684,7 @@ def similarity_to_leiden_clusters(
                         best_target = lc
                 cluster_labels_sub[sc_genes_idx] = best_target
 
-    # Relabel clusters contiguously
+    # Relabel contiguously
     unique_labels = sorted(set(cluster_labels_sub))
     label_map = {old: new for new, old in enumerate(unique_labels)}
     cluster_labels_sub = np.array([label_map[l] for l in cluster_labels_sub])
@@ -562,17 +696,16 @@ def similarity_to_leiden_clusters(
     for i, idx in enumerate(annotated_idx):
         cluster_labels[idx] = cluster_labels_sub[i]
 
-    # Assign unannotated genes to a residual cluster
+    # Assign truly dark genes to residual cluster
     residual_cluster = n_clusters
     cluster_labels[cluster_labels == -1] = residual_cluster
 
-    # Format labels
     labels_str = [f"{view_name}_{cl}" for cl in cluster_labels]
 
-    # Cluster size summary
     cluster_sizes = pd.Series(cluster_labels).value_counts().sort_index()
+    n_residual = int((cluster_labels == residual_cluster).sum())
     logger.info(
-        f"[{view_name}] {n_clusters} clusters + 1 residual | "
+        f"[{view_name}] {n_clusters} clusters + {n_residual} residual genes | "
         f"sizes: min={cluster_sizes.min()}, median={int(cluster_sizes.median())}, max={cluster_sizes.max()}"
     )
 
@@ -584,8 +717,200 @@ def similarity_to_leiden_clusters(
 
 
 # =============================================================================
-# 6. MAIN PIPELINE
+# 7. SPECTRAL EMBEDDING (complete vocabulary)
 # =============================================================================
+
+def auto_n_components(n_genes: int) -> int:
+    """
+    Automatic spectral embedding dimensionality:
+    floor(floor(sqrt(n_genes)) / 8) * 8
+
+    Examples: 5127 → 64, 19180 → 136, 2000 → 40
+    """
+    return int(np.floor(np.floor(np.sqrt(n_genes)) / 8) * 8)
+
+
+def build_knn_embeddings(
+    sim: np.ndarray,
+    genes: list[str],
+    k: int = 15,
+    n_components: int | None = None,
+    esm_embeddings: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    """
+    Spectral embedding of the kNN-sparsified similarity matrix.
+    Euclidean distance in this space ≈ diffusion distance on the gene graph.
+
+    COMPLETE VOCABULARY GUARANTEE: every gene in `genes` receives an embedding.
+    - Connected genes: spectral embedding coordinates
+    - Disconnected genes with ESM-2: kNN regression from ESM-2 neighbors'
+      spectral coordinates
+    - Truly dark genes (no signal, no ESM): mean embedding + small noise
+
+    Parameters
+    ----------
+    sim : np.ndarray
+        (n, n) similarity matrix (possibly imputed).
+    genes : list[str]
+        Gene symbols.
+    k : int
+        kNN for graph sparsification.
+    n_components : int, optional
+        Embedding dimensionality. Auto-computed if None.
+    esm_embeddings : dict, optional
+        ESM-2 raw embeddings for fallback placement of disconnected genes.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        gene → embedding vector (float32). Guaranteed to contain ALL genes.
+    """
+    from sklearn.manifold import SpectralEmbedding
+
+    n = len(genes)
+
+    if n_components is None:
+        n_components = auto_n_components(n)
+    n_components = max(8, min(n_components, n - 2))
+
+    logger.info(f"Spectral embedding: n_genes={n}, n_components={n_components}, k={k}")
+
+    # Identify connected vs disconnected genes
+    has_signal = np.any(sim > 0, axis=1)
+    connected_idx = np.where(has_signal)[0]
+    disconnected_idx = np.where(~has_signal)[0]
+
+    if len(connected_idx) < n_components + 2:
+        logger.warning(
+            f"Too few connected genes ({len(connected_idx)}) for spectral embedding "
+            f"(need ≥ {n_components + 2}). Falling back to zero embeddings."
+        )
+        return {g: np.zeros(n_components, dtype=np.float32) for g in genes}
+
+    # --- Spectral embedding on connected subgraph only ---
+    sim_connected = sim[np.ix_(connected_idx, connected_idx)]
+    n_conn = len(connected_idx)
+    k_eff = min(k, n_conn - 1)
+
+    # kNN sparsification
+    sim_sparse = np.zeros_like(sim_connected)
+    for i in range(n_conn):
+        top_k_idx = np.argsort(sim_connected[i])[-k_eff:]
+        sim_sparse[i, top_k_idx] = sim_connected[i, top_k_idx]
+
+    # Symmetrize
+    sim_sparse = np.maximum(sim_sparse, sim_sparse.T)
+
+    n_comp_eff = min(n_components, n_conn - 2)
+    se = SpectralEmbedding(
+        n_components=n_comp_eff,
+        affinity="precomputed",
+        random_state=1234,
+    )
+    emb_connected = se.fit_transform(sim_sparse).astype(np.float32)
+
+    # Pad if n_comp_eff < n_components (very small connected set)
+    if n_comp_eff < n_components:
+        pad = np.zeros((n_conn, n_components - n_comp_eff), dtype=np.float32)
+        emb_connected = np.hstack([emb_connected, pad])
+
+    # --- Place ALL genes into the embedding ---
+    full_emb = np.full((n, n_components), np.nan, dtype=np.float32)
+
+    # Connected genes: direct spectral coordinates
+    for local_i, global_i in enumerate(connected_idx):
+        full_emb[global_i] = emb_connected[local_i]
+
+    # Disconnected genes: fallback strategies
+    if len(disconnected_idx) > 0:
+        n_esm_placed = 0
+
+        # Strategy A: if ESM-2 available, use kNN regression in ESM space
+        # to inherit spectral coordinates from nearest connected genes
+        if esm_embeddings:
+            esm_dim = next(iter(esm_embeddings.values())).shape[0]
+            esm_mat = np.zeros((n, esm_dim), dtype=np.float32)
+            has_esm = np.zeros(n, dtype=bool)
+            for i, g in enumerate(genes):
+                if g in esm_embeddings:
+                    esm_mat[i] = esm_embeddings[g]
+                    has_esm[i] = True
+
+            esm_norms = np.linalg.norm(esm_mat, axis=1, keepdims=True)
+            esm_norms[esm_norms == 0] = 1.0
+            esm_normed = esm_mat / esm_norms
+
+            # Connected genes that also have ESM (regression targets)
+            target_mask = has_signal & has_esm
+            target_idx = np.where(target_mask)[0]
+
+            if len(target_idx) > 0:
+                for di in disconnected_idx:
+                    if not has_esm[di]:
+                        continue  # truly dark, handled in Strategy B
+
+                    cos_sims = esm_normed[di] @ esm_normed[target_idx].T
+                    k_reg = min(10, len(target_idx))
+                    top_k = np.argsort(cos_sims)[-k_reg:]
+                    top_sims = np.clip(cos_sims[top_k], 0, None)
+                    w_sum = top_sims.sum()
+                    if w_sum < 1e-8:
+                        continue
+
+                    weights = top_sims / w_sum
+                    neighbor_global = target_idx[top_k]
+                    full_emb[di] = sum(
+                        w * full_emb[gi] for w, gi in zip(weights, neighbor_global)
+                    )
+                    n_esm_placed += 1
+
+        # Strategy B: truly dark genes → mean + small noise
+        mean_emb = np.nanmean(full_emb[connected_idx], axis=0)
+        std_emb = np.nanstd(full_emb[connected_idx], axis=0)
+        std_emb[std_emb == 0] = 1e-3
+
+        rng = np.random.RandomState(42)
+        n_dark = 0
+        for i in range(n):
+            if np.any(np.isnan(full_emb[i])):
+                full_emb[i] = mean_emb + rng.randn(n_components).astype(np.float32) * std_emb * 0.1
+                n_dark += 1
+
+        if len(disconnected_idx) > 0:
+            logger.info(
+                f"  Disconnected genes: {n_esm_placed} placed via ESM-2 kNN regression, "
+                f"{n_dark} truly dark (mean + noise fallback)"
+            )
+
+    # Final NaN check (should never trigger but safety)
+    nan_mask = np.any(np.isnan(full_emb), axis=1)
+    if nan_mask.any():
+        logger.error(f"  {nan_mask.sum()} genes still have NaN embeddings! Setting to zero.")
+        full_emb[nan_mask] = 0.0
+
+    gene_vocabulary = {g: full_emb[i] for i, g in enumerate(genes)}
+
+    assert len(gene_vocabulary) == len(genes), (
+        f"Vocabulary incomplete: {len(gene_vocabulary)}/{len(genes)}"
+    )
+
+    return gene_vocabulary
+
+
+# =============================================================================
+# 8. MAIN PIPELINE
+# =============================================================================
+
+def pickle_save(obj: object, path: str):
+    with open(path, "wb") as f:
+        pkl.dump(obj, f)
+
+
+def pickle_load(path: str):
+    with open(path, "rb") as f:
+        obj = pkl.load(f)
+    return obj
+
 
 def run_multiview_clustering(
     genes: list[str],
@@ -597,33 +922,49 @@ def run_multiview_clustering(
     skip_coexpr: bool = False,
     k: int = 15,
     resolution: float = 1.0,
+    k_transfer: int = 10,
+    alpha_impute: float = 0.7,
     cache_dir: Optional[str] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Run the full multi-view gene clustering pipeline.
 
+    Pipeline order (ESM + co-expression computed first as transfer sources):
+      1. ESM-2 raw embeddings
+      2. Co-expression similarity
+      3. Reactome pathways (with imputation)
+      4. GO:BP (with imputation)
+      5. GO:CC (with imputation)
+      6. GO:MF (with imputation)
+      7. ESM-2 similarity view (no imputation — it IS the source)
+      8. Co-expression view (no imputation)
+
     Parameters
     ----------
     genes : list[str]
-        List of gene symbols (e.g., 5127 genes from your scRNA-seq).
+        List of gene symbols.
     output_dir : str
         Directory to save results.
     adata_path : str, optional
-        Path to .h5ad for co-expression view. Skipped if None.
+        Path to .h5ad for co-expression view.
     esm_model : str
         ESM-2 model name.
     esm_device : str
         "cpu" or "cuda".
     skip_esm : bool
-        Skip ESM-2 view (requires network + GPU).
+        Skip ESM-2 entirely (no imputation, no ESM view).
     skip_coexpr : bool
         Skip co-expression view.
     k : int
         kNN neighbors for graph construction.
     resolution : float
         Leiden resolution.
+    k_transfer : int
+        Number of neighbors for ESM-2 kNN annotation transfer.
+    alpha_impute : float
+        Weight on ESM vs co-expression in imputation (1.0 = ESM only).
     cache_dir : str, optional
-        Cache intermediate results (similarity matrices, embeddings).
+        Cache intermediate results.
 
     Returns
     -------
@@ -634,116 +975,184 @@ def run_multiview_clustering(
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
 
-    genes = list(genes)  # ensure ordered
+    genes = list(genes)
     n = len(genes)
     logger.info(f"Starting multi-view clustering for {n} genes")
 
     results = {}
+    sim_matrices = {}
+    all_embeddings = {}  # view → gene vocabulary
 
-    # ---- View 1: Reactome Pathways ----
-    logger.info("=" * 60)
-    logger.info("VIEW 1: Reactome Pathways")
-    logger.info("=" * 60)
-    reactome_sets = fetch_msigdb_gene_sets("C2", "CP:REACTOME")
-    sim_reactome = build_comembership_matrix(genes, reactome_sets, min_set_size=5, max_set_size=500)
-    results["reactome"] = similarity_to_leiden_clusters(
-        sim_reactome, genes, k=k, resolution=resolution, view_name="reactome"
-    )
-    if cache_dir:
-        np.save(os.path.join(cache_dir, "sim_reactome.npy"), sim_reactome)
+    # ==================================================================
+    # PHASE 1: Compute transfer sources (ESM-2 + co-expression)
+    # ==================================================================
 
-    # ---- View 2: GO Biological Process ----
-    logger.info("=" * 60)
-    logger.info("VIEW 2: GO Biological Process")
-    logger.info("=" * 60)
-    gobp_sets = fetch_msigdb_gene_sets("C5", "GO:BP")
-    sim_gobp = build_comembership_matrix(genes, gobp_sets, min_set_size=10, max_set_size=500)
-    results["go_bp"] = similarity_to_leiden_clusters(
-        sim_gobp, genes, k=k, resolution=resolution, view_name="go_bp"
-    )
-    if cache_dir:
-        np.save(os.path.join(cache_dir, "sim_go_bp.npy"), sim_gobp)
+    esm_embeddings = {}   # raw PLM embeddings (for imputation)
+    sim_coexpr = None      # co-expression similarity (for imputation)
 
-    # ---- View 3: GO Cellular Component ----
-    logger.info("=" * 60)
-    logger.info("VIEW 3: GO Cellular Component")
-    logger.info("=" * 60)
-    gocc_sets = fetch_msigdb_gene_sets("C5", "GO:CC")
-    sim_gocc = build_comembership_matrix(genes, gocc_sets, min_set_size=5, max_set_size=500)
-    results["go_cc"] = similarity_to_leiden_clusters(
-        sim_gocc, genes, k=k, resolution=resolution, view_name="go_cc"
-    )
-    if cache_dir:
-        np.save(os.path.join(cache_dir, "sim_go_cc.npy"), sim_gocc)
-
-    # ---- View 4: GO Molecular Function ----
-    logger.info("=" * 60)
-    logger.info("VIEW 4: GO Molecular Function")
-    logger.info("=" * 60)
-    gomf_sets = fetch_msigdb_gene_sets("C5", "GO:MF")
-    sim_gomf = build_comembership_matrix(genes, gomf_sets, min_set_size=5, max_set_size=500)
-    results["go_mf"] = similarity_to_leiden_clusters(
-        sim_gomf, genes, k=k, resolution=resolution, view_name="go_mf"
-    )
-    if cache_dir:
-        np.save(os.path.join(cache_dir, "sim_go_mf.npy"), sim_gomf)
-
-    # ---- View 5: ESM-2 Protein Embeddings ----
+    # ---- ESM-2 raw embeddings (transfer source) ----
     if not skip_esm:
         logger.info("=" * 60)
-        logger.info("VIEW 5: ESM-2 Protein Language Model")
+        logger.info("PHASE 1a: ESM-2 raw embeddings (transfer source)")
         logger.info("=" * 60)
 
         emb_cache = os.path.join(cache_dir, "esm2_embeddings.pkl") if cache_dir else None
 
         if emb_cache and os.path.exists(emb_cache):
             logger.info(f"Loading cached ESM-2 embeddings from {emb_cache}")
-            with open(emb_cache, "rb") as f:
-                esm_embeddings = pickle.load(f)
+            esm_embeddings = pickle_load(emb_cache)
         else:
             seqs = fetch_protein_sequences(genes)
             esm_embeddings = compute_esm2_embeddings(seqs, model_name=esm_model, device=esm_device)
             if emb_cache:
-                with open(emb_cache, "wb") as f:
-                    pickle.dump(esm_embeddings, f)
+                pickle_save(esm_embeddings, emb_cache)
+
+        logger.info(f"ESM-2 coverage: {len(esm_embeddings)}/{n} genes")
+    else:
+        logger.info("Skipping ESM-2 (--skip-esm) — no imputation will be performed")
+
+    # ---- Co-expression similarity (secondary transfer source) ----
+    if adata_path and not skip_coexpr:
+        logger.info("=" * 60)
+        logger.info("PHASE 1b: Co-expression similarity (transfer source)")
+        logger.info("=" * 60)
+
+        coexpr_cache = os.path.join(cache_dir, "sim_coexpression.npy") if cache_dir else None
+        if coexpr_cache and os.path.exists(coexpr_cache):
+            logger.info(f"Loading cached co-expression similarity from {coexpr_cache}")
+            sim_coexpr = np.load(coexpr_cache)
+        else:
+            sim_coexpr = build_coexpression_similarity(genes, adata_path)
+            if coexpr_cache:
+                np.save(coexpr_cache, sim_coexpr)
+
+    # ==================================================================
+    # PHASE 2: Annotation views (with imputation from Phase 1 sources)
+    # ==================================================================
+
+    annotation_views = [
+        ("reactome", "C2", "CP:REACTOME", 5, 500),
+        ("go_bp", "C5", "GO:BP", 10, 500),
+        ("go_cc", "C5", "GO:CC", 5, 500),
+        ("go_mf", "C5", "GO:MF", 5, 500),
+    ]
+
+    for view_name, collection, subcollection, min_sz, max_sz in annotation_views:
+        logger.info("=" * 60)
+        logger.info(f"PHASE 2: {view_name.upper()} (annotation view with imputation)")
+        logger.info("=" * 60)
+
+        gene_sets = fetch_msigdb_gene_sets(collection, subcollection)
+        sim_raw = build_comembership_matrix(genes, gene_sets, min_set_size=min_sz, max_set_size=max_sz)
+
+        n_annotated_raw = int(np.any(sim_raw > 0, axis=1).sum())
+
+        # Impute residual genes if ESM-2 is available
+        if esm_embeddings:
+            sim_imputed = impute_residual_features(
+                sim_raw, genes, esm_embeddings,
+                k_transfer=k_transfer,
+                coexpr_sim=sim_coexpr,
+                alpha=alpha_impute,
+                view_name=view_name,
+            )
+        else:
+            sim_imputed = sim_raw
+
+        n_with_signal = int(np.any(sim_imputed > 0, axis=1).sum())
+        logger.info(
+            f"[{view_name}] Coverage: {n_annotated_raw} annotated → "
+            f"{n_with_signal} after imputation (of {n} total)"
+        )
+
+        # Cluster on imputed similarity
+        results[view_name] = similarity_to_leiden_clusters(
+            sim_imputed, genes, k=k, resolution=resolution, view_name=view_name
+        )
+        sim_matrices[view_name] = sim_imputed
+
+        # Spectral embedding (complete vocabulary)
+        emb = build_knn_embeddings(
+            sim_imputed, genes, k=k, esm_embeddings=esm_embeddings
+        )
+        all_embeddings[view_name] = emb
+
+        if cache_dir:
+            np.save(os.path.join(cache_dir, f"sim_{view_name}.npy"), sim_imputed)
+            pickle_save(emb, os.path.join(cache_dir, f"gene_emb_{view_name}.pkl"))
+
+    # ==================================================================
+    # PHASE 3: Non-annotation views (no imputation needed)
+    # ==================================================================
+
+    # ---- ESM-2 similarity view ----
+    if not skip_esm and esm_embeddings:
+        logger.info("=" * 60)
+        logger.info("PHASE 3a: ESM-2 similarity view (direct, no imputation)")
+        logger.info("=" * 60)
 
         sim_esm = build_esm_similarity_matrix(genes, esm_embeddings)
         results["esm2"] = similarity_to_leiden_clusters(
             sim_esm, genes, k=k, resolution=resolution, view_name="esm2"
         )
+        sim_matrices["esm2"] = sim_esm
+
+        emb_esm = build_knn_embeddings(
+            sim_esm, genes, k=k, esm_embeddings=esm_embeddings
+        )
+        all_embeddings["esm2"] = emb_esm
+
         if cache_dir:
             np.save(os.path.join(cache_dir, "sim_esm2.npy"), sim_esm)
-    else:
-        logger.info("Skipping ESM-2 view (--skip-esm)")
+            pickle_save(emb_esm, os.path.join(cache_dir, "gene_emb_esm2.pkl"))
 
-    # ---- View 6: Co-expression ----
-    if adata_path and not skip_coexpr:
+    # ---- Co-expression view ----
+    if sim_coexpr is not None:
         logger.info("=" * 60)
-        logger.info("VIEW 6: Co-expression from scRNA-seq data")
+        logger.info("PHASE 3b: Co-expression view (direct, no imputation)")
         logger.info("=" * 60)
-        sim_coexpr = build_coexpression_similarity(genes, adata_path)
+
         results["coexpression"] = similarity_to_leiden_clusters(
             sim_coexpr, genes, k=k, resolution=resolution, view_name="coexpression"
         )
+        sim_matrices["coexpression"] = sim_coexpr
+
+        emb_coexpr = build_knn_embeddings(
+            sim_coexpr, genes, k=k, esm_embeddings=esm_embeddings
+        )
+        all_embeddings["coexpression"] = emb_coexpr
+
         if cache_dir:
             np.save(os.path.join(cache_dir, "sim_coexpression.npy"), sim_coexpr)
-    elif not skip_coexpr:
-        logger.info("Skipping co-expression view (no --adata provided)")
+            pickle_save(emb_coexpr, os.path.join(cache_dir, "gene_emb_coexpression.pkl"))
 
-    # ---- Save results ----
-    save_results(results, genes, output_dir)
+    # ==================================================================
+    # PHASE 4: Save & visualize
+    # ==================================================================
+
+    save_results(results, genes, output_dir, all_embeddings)
+    plot_cluster_views(results, sim_matrices, genes, output_dir)
+
+    # Vocabulary completeness check
+    for view_name, emb_dict in all_embeddings.items():
+        missing = [g for g in genes if g not in emb_dict]
+        if missing:
+            logger.error(f"[{view_name}] VOCABULARY INCOMPLETE: {len(missing)} genes missing!")
+        else:
+            logger.info(f"[{view_name}] Vocabulary complete: {len(emb_dict)} genes ✓")
 
     return results
 
 
 # =============================================================================
-# 7. SAVE & SUMMARIZE
+# 9. SAVE & SUMMARIZE
 # =============================================================================
 
 def save_results(
     results: dict[str, pd.DataFrame],
     genes: list[str],
     output_dir: str,
+    all_embeddings: dict[str, dict[str, np.ndarray]] | None = None,
 ):
     """Save all clustering results in multiple convenient formats."""
 
@@ -751,13 +1160,13 @@ def save_results(
     for view_name, df in results.items():
         df.to_csv(os.path.join(output_dir, f"clusters_{view_name}.csv"), index=False)
 
-    # 2. Combined wide-format table: gene × view → cluster
+    # 2. Combined wide-format table
     combined = pd.DataFrame({"gene": genes})
     for view_name, df in results.items():
         combined[view_name] = df["cluster"].values
     combined.to_csv(os.path.join(output_dir, "clusters_all_views.csv"), index=False)
 
-    # 3. Cluster-to-gene-list JSON (useful for downstream modeling)
+    # 3. Cluster-to-gene-list JSON
     cluster_dict = {}
     for view_name, df in results.items():
         view_clusters = defaultdict(list)
@@ -768,7 +1177,15 @@ def save_results(
     with open(os.path.join(output_dir, "cluster_gene_lists.json"), "w") as f:
         json.dump(cluster_dict, f, indent=2)
 
-    # 4. Summary statistics
+    # 4. Gene embeddings (complete vocabularies)
+    if all_embeddings:
+        emb_dir = os.path.join(output_dir, "embeddings")
+        os.makedirs(emb_dir, exist_ok=True)
+        for view_name, emb_dict in all_embeddings.items():
+            pickle_save(emb_dict, os.path.join(emb_dir, f"gene_emb_{view_name}.pkl"))
+        logger.info(f"Gene embeddings saved to {emb_dir}/")
+
+    # 5. Summary statistics
     summary_lines = ["Multi-View Gene Clustering Summary", "=" * 40]
     for view_name, df in results.items():
         n_clusters = df["cluster"].nunique()
@@ -789,7 +1206,138 @@ def save_results(
 
 
 # =============================================================================
-# 8. CLI
+# 10. PLOTTING
+# =============================================================================
+
+def plot_cluster_views(
+    results: dict[str, pd.DataFrame],
+    sim_matrices: dict[str, np.ndarray],
+    genes: list[str],
+    output_dir: str,
+    n_neighbors_umap: int = 15,
+    min_dist: float = 0.3,
+):
+    """
+    Create a multi-panel figure: one UMAP per view, colored by Leiden cluster.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    try:
+        from umap import UMAP
+    except ImportError:
+        logger.warning("umap-learn not installed, skipping plot. Install with: pip install umap-learn")
+        return
+
+    views = sorted(results.keys())
+    n_views = len(views)
+    if n_views == 0:
+        return
+
+    ncols = min(3, n_views)
+    nrows = (n_views + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 6 * nrows), dpi=150)
+    if n_views == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    for idx, view_name in enumerate(views):
+        ax = axes[idx]
+        sim = sim_matrices[view_name]
+        df = results[view_name]
+
+        sim_clipped = np.clip(sim, 0, None)
+        np.fill_diagonal(sim_clipped, 1.0)
+        dist = 1.0 - sim_clipped
+        np.fill_diagonal(dist, 0.0)
+
+        reducer = UMAP(
+            n_neighbors=min(n_neighbors_umap, len(genes) - 1),
+            min_dist=min_dist,
+            metric="precomputed",
+            random_state=42,
+        )
+        coords = reducer.fit_transform(dist)
+
+        cluster_labels = df["cluster"].values
+        unique_clusters = sorted(set(cluster_labels))
+        cluster_to_int = {c: i for i, c in enumerate(unique_clusters)}
+        cluster_ints = np.array([cluster_to_int[c] for c in cluster_labels])
+        n_clusters = len(unique_clusters)
+
+        # Identify residual cluster (highest numeric suffix)
+        max_suffix = max(int(c.split("_")[-1]) for c in unique_clusters)
+        residual_label = f"{view_name}_{max_suffix}"
+        is_residual = cluster_labels == residual_label
+
+        if n_clusters <= 20:
+            base_cmap = plt.cm.tab20
+        else:
+            base_cmap = plt.cm.gist_ncar
+
+        colors = np.array([base_cmap(cluster_ints[i] / max(n_clusters - 1, 1)) for i in range(len(genes))])
+        colors[is_residual] = (0.85, 0.85, 0.85, 1.0)
+
+        if is_residual.any():
+            ax.scatter(
+                coords[is_residual, 0], coords[is_residual, 1],
+                c=[(0.85, 0.85, 0.85, 1.0)],
+                s=4, alpha=0.3, rasterized=True,
+            )
+        ax.scatter(
+            coords[~is_residual, 0], coords[~is_residual, 1],
+            c=colors[~is_residual],
+            s=6, alpha=0.7, rasterized=True,
+        )
+
+        n_real = n_clusters - (1 if is_residual.any() else 0)
+        n_residual = int(is_residual.sum())
+        ax.set_title(f"{view_name}\n{n_real} clusters, {n_residual} residual genes", fontsize=12)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("UMAP 1", fontsize=9)
+        ax.set_ylabel("UMAP 2", fontsize=9)
+
+    for idx in range(n_views, len(axes)):
+        axes[idx].set_visible(False)
+
+    fig.suptitle("Multi-View Gene Clustering", fontsize=16, y=1.02)
+    plt.tight_layout()
+
+    plot_path = os.path.join(output_dir, "cluster_views_umap.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Cluster UMAP plot saved to {plot_path}")
+
+    # --- Cluster size distributions ---
+    fig2, axes2 = plt.subplots(1, n_views, figsize=(4 * n_views, 3.5), dpi=150)
+    if n_views == 1:
+        axes2 = [axes2]
+
+    for idx, view_name in enumerate(views):
+        ax = axes2[idx]
+        df = results[view_name]
+        sizes = df["cluster"].value_counts().sort_values(ascending=False)
+
+        max_suffix = max(int(c.split("_")[-1]) for c in sizes.index)
+        residual_label = f"{view_name}_{max_suffix}"
+        bar_colors = ["#cccccc" if label == residual_label else "#4c72b0" for label in sizes.index]
+
+        ax.bar(range(len(sizes)), sizes.values, color=bar_colors, edgecolor="none")
+        ax.set_title(f"{view_name} ({len(sizes)} clusters)", fontsize=11)
+        ax.set_xlabel("Cluster rank", fontsize=9)
+        ax.set_ylabel("# genes", fontsize=9)
+        ax.tick_params(labelsize=8)
+
+    plt.tight_layout()
+    sizes_path = os.path.join(output_dir, "cluster_sizes.png")
+    fig2.savefig(sizes_path, dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    logger.info(f"Cluster size distribution plot saved to {sizes_path}")
+
+
+# =============================================================================
+# 11. CLI
 # =============================================================================
 
 def main():
@@ -798,10 +1346,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic: annotation-based views only (no GPU needed)
+  # Basic: annotation-based views only (no GPU needed, no imputation)
   python multiview_gene_clusters.py --genes gene_list.txt --skip-esm --output clusters/
 
-  # Full: all views including ESM-2 on GPU + co-expression from your data
+  # Full: all views including ESM-2 on GPU + co-expression + imputation
   python multiview_gene_clusters.py --genes gene_list.txt --adata data.h5ad \\
       --esm-device cuda --output clusters/
 
@@ -814,15 +1362,16 @@ Examples:
     parser.add_argument("--adata", default=None, help="Path to .h5ad for co-expression view")
     parser.add_argument("--esm-model", default="esm2_t33_650M_UR50D", help="ESM-2 model name")
     parser.add_argument("--esm-device", default="cpu", choices=["cpu", "cuda"], help="Device for ESM-2")
-    parser.add_argument("--skip-esm", action="store_true", help="Skip ESM-2 view")
+    parser.add_argument("--skip-esm", action="store_true", help="Skip ESM-2 view AND imputation")
     parser.add_argument("--skip-coexpr", action="store_true", help="Skip co-expression view")
     parser.add_argument("--k", type=int, default=15, help="kNN neighbors (default: 15)")
     parser.add_argument("--resolution", type=float, default=1.0, help="Leiden resolution (default: 1.0)")
+    parser.add_argument("--k-transfer", type=int, default=15, help="kNN for ESM-2 annotation transfer (default: 15)")
+    parser.add_argument("--alpha-impute", type=float, default=0.7, help="ESM vs co-expression weight for imputation (default: 0.7)")
     parser.add_argument("--cache", default=None, help="Cache directory for intermediate results")
 
     args = parser.parse_args()
 
-    # Load gene list
     with open(args.genes) as f:
         genes = [line.strip() for line in f if line.strip()]
     logger.info(f"Loaded {len(genes)} genes from {args.genes}")
@@ -837,6 +1386,8 @@ Examples:
         skip_coexpr=args.skip_coexpr,
         k=args.k,
         resolution=args.resolution,
+        k_transfer=args.k_transfer,
+        alpha_impute=args.alpha_impute,
         cache_dir=args.cache,
     )
 
