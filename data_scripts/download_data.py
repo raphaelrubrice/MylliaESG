@@ -173,20 +173,19 @@ def preprocess_h5ad(
     gene_list: Optional[list[str]] = None,
     gene_symbol_col: Optional[str] = None,
     copy: bool = False,
+    precomputed_row_sums: Optional[np.ndarray] = None,
 ) -> "anndata.AnnData":
     """
     Universal preprocessing pipeline for raw count AnnData.
 
-    Memory-efficient: operates entirely on sparse matrices, never densifies.
-    Library-size normalization is computed on ALL genes before subsetting,
-    ensuring correctness regardless of when gene filtering occurs.
+    Memory-efficient: handles both sparse and dense inputs without OOM.
+    When X is stored dense on disk (e.g. Replogle datasets), the pipeline:
+      1. Computes library-size factors on the full dense matrix (row sums only)
+      2. Subsets to gene_list while still dense (dramatically shrinks the matrix)
+      3. Converts the SMALLER subset to sparse CSR
+      4. Applies normalization and log-transform in sparse space
 
-    Steps:
-        1. Compute per-cell library size on full gene set (sparse row sums)
-        2. Subset to gene list early (reduces memory footprint)
-        3. Per-cell library-size normalization → scale to target_sum
-        4. log2(x + 1) transformation (sparse-safe: zeros stay zero)
-        5. Store raw counts in .layers["raw_counts"]
+    This avoids the ~2× peak memory of converting a full dense matrix to sparse.
 
     Parameters
     ----------
@@ -202,12 +201,16 @@ def preprocess_h5ad(
         Column in .var containing gene symbols. If None, uses .var_names.
     copy : bool
         If True, operate on a copy. Default False to save memory.
+    precomputed_row_sums : np.ndarray, optional
+        Pre-computed per-cell total UMI counts (from all genes, before subsetting).
+        Used when the caller computed row sums from backed mode to avoid re-reading.
 
     Returns
     -------
     AnnData with normalized expression in .X and raw counts in .layers["raw_counts"]
     """
     import anndata
+    import gc
     from scipy import sparse
 
     if copy:
@@ -216,42 +219,61 @@ def preprocess_h5ad(
     n_cells, n_genes = adata.shape
     logger.info(f"Preprocessing: {n_cells:,} cells × {n_genes:,} genes")
 
-    # Ensure sparse CSR format
-    if not sparse.issparse(adata.X):
-        logger.info("  Converting dense matrix to sparse CSR...")
-        adata.X = sparse.csr_matrix(adata.X, dtype=np.float32)
-    elif adata.X.dtype != np.float32:
-        adata.X = adata.X.astype(np.float32)
+    is_sparse = sparse.issparse(adata.X)
 
-    # --- Step 0: Sanity checks (sparse-safe, no densification) ---
-    row_sums = np.asarray(adata.X.sum(axis=1)).ravel()
+    # =====================================================================
+    # Step 0: Compute library-size scaling on ALL genes BEFORE any subset.
+    #         This preserves correctness (normalization reflects full transcriptome).
+    #         Uses precomputed_row_sums if provided (from backed mode loading).
+    # =====================================================================
+    if precomputed_row_sums is not None:
+        row_sums = precomputed_row_sums.astype(np.float64)
+        logger.info(f"  Using precomputed library sizes (from backed mode)")
+    elif is_sparse:
+        row_sums = np.asarray(adata.X.sum(axis=1)).ravel().astype(np.float64)
+    else:
+        # Dense: compute row sums without copying the matrix
+        row_sums = adata.X.sum(axis=1).astype(np.float64)
+        if row_sums.ndim == 2:
+            row_sums = row_sums.ravel()
+
     min_sum, max_sum = row_sums.min(), row_sums.max()
     median_sum = np.median(row_sums)
     logger.info(
         f"  UMI counts per cell: min={min_sum:.0f}, median={median_sum:.0f}, max={max_sum:.0f}"
     )
 
+    # Sanity checks
     if median_sum < 100:
         logger.warning(
             "  ⚠ Median UMI count is very low (<100). Data may already be normalized "
             "or log-transformed. Proceeding anyway — verify your input."
         )
-    # Check for negatives using sparse .data array (only stored values)
-    if adata.X.data.size > 0 and np.any(adata.X.data < 0):
-        logger.warning("  ⚠ Negative values detected. Data may already be log-transformed.")
+    if is_sparse:
+        if adata.X.data.size > 0 and np.any(adata.X.data < 0):
+            logger.warning("  ⚠ Negative values detected. Data may already be log-transformed.")
+    else:
+        # For dense, sample to avoid scanning entire matrix
+        sample_size = min(10_000, n_cells)
+        sample_idx = np.random.RandomState(42).choice(n_cells, sample_size, replace=False)
+        if np.any(adata.X[sample_idx] < 0):
+            logger.warning("  ⚠ Negative values detected. Data may already be log-transformed.")
     if len(row_sums) > 1 and np.allclose(row_sums, row_sums[0], rtol=1e-3):
         logger.warning(
             "  ⚠ All cells have near-identical total counts — data may already be "
             "library-size normalized."
         )
 
-    # --- Step 1: Compute library-size scaling on ALL genes BEFORE subsetting ---
-    # This preserves correctness: normalization factors reflect the full transcriptome.
+    # Precompute scaling factors from full-transcriptome library sizes
     cell_totals = row_sums.copy()
     cell_totals[cell_totals == 0] = 1.0
     scaling_factors = (target_sum / cell_totals).astype(np.float32)
+    del row_sums, cell_totals
 
-    # --- Step 2: Subset genes EARLY to reduce memory for downstream ops ---
+    # =====================================================================
+    # Step 1: Subset genes EARLY to reduce memory for all downstream ops.
+    #         Critical for dense data: 8.5K→5.1K cols saves ~40% memory.
+    # =====================================================================
     if gene_list is not None:
         if gene_symbol_col and gene_symbol_col in adata.var.columns:
             var_genes = adata.var[gene_symbol_col].values
@@ -273,25 +295,43 @@ def preprocess_h5ad(
 
         col_mask = np.isin(var_genes, list(gene_set))
         adata = adata[:, col_mask]
-        # Use copy only on the now-smaller matrix to defragment memory
+        # .copy() materializes the subset and releases the reference to the 
+        # original full matrix, allowing GC to free it
         adata = adata.copy()
+        gc.collect()
         logger.info(f"  After subsetting: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes")
 
-    # --- Step 3: Store raw counts AFTER gene subset (much smaller) ---
+    # =====================================================================
+    # Step 2: Ensure sparse CSR format.
+    #         NOW safe to convert: after gene subsetting the matrix is much smaller.
+    #         e.g. 310K × 5.1K × 4B ≈ 6.3 GB → sparse ≈ 1-2 GB
+    # =====================================================================
+    if not sparse.issparse(adata.X):
+        logger.info(f"  Converting dense matrix ({adata.shape[0]:,} × {adata.shape[1]:,}) to sparse CSR...")
+        adata.X = sparse.csr_matrix(adata.X, dtype=np.float32)
+        gc.collect()
+        logger.info(f"  ✓ Sparse conversion done (nnz={adata.X.nnz:,})")
+    elif adata.X.dtype != np.float32:
+        adata.X = adata.X.astype(np.float32)
+
+    # =====================================================================
+    # Step 3: Store raw counts (after subset, much smaller footprint)
+    # =====================================================================
     adata.layers["raw_counts"] = adata.X.copy()
     logger.info("  Stored raw counts in .layers['raw_counts']")
 
-    # --- Step 4: Library-size normalize + scale (sparse row-scaling) ---
-    # Multiply each row i by scaling_factors[i] using a diagonal matrix.
-    # This is memory-efficient: creates a new sparse matrix with same sparsity.
+    # =====================================================================
+    # Step 4: Library-size normalize + scale (sparse row-scaling via diagonal matrix)
+    # =====================================================================
     X_norm = sparse.diags(scaling_factors).dot(adata.X)
     if not sparse.isspmatrix_csr(X_norm):
         X_norm = X_norm.tocsr()
     logger.info(f"  Per-cell library-size normalization + scale to {target_sum:,.0f} done")
 
-    # --- Step 5: Log transformation (in-place on sparse .data) ---
-    # log(0 + 1) = 0, so zero entries are correct by omission in sparse format.
-    # We only need to transform the explicitly stored non-zero values.
+    # =====================================================================
+    # Step 5: Log transformation (in-place on sparse .data array)
+    #         log(0 + 1) = 0, so zero entries stay zero by omission.
+    # =====================================================================
     X_norm = X_norm.copy()  # ensure we own the data array
     if log_base == 2:
         X_norm.data = np.log2(X_norm.data + 1)
@@ -305,7 +345,9 @@ def preprocess_h5ad(
 
     adata.X = X_norm
 
-    # --- Final stats (sparse-safe: sample or use .data array) ---
+    # =====================================================================
+    # Final stats (sparse-safe: use .data array, never densify)
+    # =====================================================================
     nnz = adata.X.nnz
     total_elements = adata.shape[0] * adata.shape[1]
     sparsity = 100.0 * (1.0 - nnz / total_elements) if total_elements > 0 else 0.0
@@ -335,23 +377,38 @@ def fetch_hgnc_mapper(
     by querying the official HGNC complete set.
     
     Strategy:
-    1. Downloads 'hgnc_complete_set.json' from EBI (cached locally).
+    1. Downloads 'hgnc_complete_set.json' from HGNC Google Cloud Storage (cached locally).
     2. Builds a lookup table from Previous/Alias symbols -> Approved Symbol.
     3. Returns a dict containing ONLY the genes from 'genes_to_check' that need renaming.
     """
     # 1. Download HGNC reference if missing
     if not cache_path.exists():
-        url = "http://ftp.ebi.ac.uk/pub/databases/genenames/hgnc/json/hgnc_complete_set.json"
+        # Primary: HGNC's Google Cloud Storage bucket (current as of 2025)
+        # Fallback: old EBI FTP mirror (may still work for some users)
+        urls = [
+            "https://storage.googleapis.com/public-download-files/hgnc/json/json/hgnc_complete_set.json",
+            "https://ftp.ebi.ac.uk/pub/databases/genenames/hgnc/json/hgnc_complete_set.json",
+        ]
         logger.info(f"  Downloading HGNC complete set for gene harmonization...")
-        try:
-            r = requests.get(url, stream=True)
-            r.raise_for_status()
-            with open(cache_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            logger.info(f"  ✓ Cached HGNC reference to {cache_path}")
-        except Exception as e:
-            logger.warning(f"  ⚠ Could not download HGNC reference: {e}. Skipping harmonization.")
+        downloaded = False
+        for url in urls:
+            try:
+                r = requests.get(url, stream=True, timeout=120)
+                r.raise_for_status()
+                with open(cache_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                logger.info(f"  ✓ Cached HGNC reference to {cache_path}")
+                downloaded = True
+                break
+            except Exception as e:
+                logger.warning(f"  ⚠ Failed to download from {url}: {e}")
+                if cache_path.exists():
+                    cache_path.unlink()  # remove partial download
+                continue
+        
+        if not downloaded:
+            logger.warning("  ⚠ Could not download HGNC reference from any source. Skipping harmonization.")
             return {}
 
     # 2. Load and build lookup tables
@@ -658,13 +715,19 @@ def load_and_tag_metadata(
         logger.info(f"    No batch column found ('{batch_col}'), using default")
 
     # --- nCount_RNA (total UMI per cell) ---
+    # Prefer existing obs column (e.g. Replogle 'UMI_count') to avoid dense X ops
     if "nCount_RNA" in obs.columns:
         logger.info(f"    nCount_RNA already present (median={obs['nCount_RNA'].median():.0f})")
+    elif "UMI_count" in obs.columns:
+        obs["nCount_RNA"] = obs["UMI_count"].values.astype(np.float64)
+        logger.info(f"    nCount_RNA from UMI_count (median={obs['nCount_RNA'].median():.0f})")
     else:
         if sparse.issparse(adata.X):
-            counts = np.array(adata.X.sum(axis=1)).flatten()
+            counts = np.asarray(adata.X.sum(axis=1)).ravel()
         else:
             counts = adata.X.sum(axis=1)
+            if counts.ndim == 2:
+                counts = counts.ravel()
         obs["nCount_RNA"] = counts
         logger.info(f"    Computed nCount_RNA (median={np.median(counts):.0f})")
 
@@ -673,26 +736,36 @@ def load_and_tag_metadata(
         logger.info(f"    nFeature_RNA already present (median={obs['nFeature_RNA'].median():.0f})")
     else:
         if sparse.issparse(adata.X):
-            n_features = np.array((adata.X > 0).sum(axis=1)).flatten()
+            n_features = np.asarray((adata.X > 0).sum(axis=1)).ravel()
         else:
-            n_features = (adata.X > 0).sum(axis=1)
+            # Chunked computation to avoid creating a full boolean copy of dense X
+            n_features = np.zeros(n_cells, dtype=np.int32)
+            chunk_size = 50_000
+            for start in range(0, n_cells, chunk_size):
+                end = min(start + chunk_size, n_cells)
+                n_features[start:end] = (adata.X[start:end] > 0).sum(axis=1).astype(np.int32)
         obs["nFeature_RNA"] = n_features
         logger.info(f"    Computed nFeature_RNA (median={np.median(n_features):.0f})")
 
     # --- percent_mt ---
     if "percent_mt" in obs.columns:
         logger.info(f"    percent_mt already present (median={obs['percent_mt'].median():.2f}%)")
+    elif "mitopercent" in obs.columns:
+        obs["percent_mt"] = obs["mitopercent"].values.astype(np.float64)
+        logger.info(f"    percent_mt from mitopercent (median={obs['percent_mt'].median():.2f}%)")
     else:
         mt_genes = [g for g in adata.var_names if g.startswith("MT-") or g.startswith("mt-")]
         if mt_genes:
+            mt_mask = np.isin(adata.var_names, mt_genes)
             if sparse.issparse(adata.X):
-                mt_mask = np.isin(adata.var_names, mt_genes)
-                mt_counts = np.array(adata.X[:, mt_mask].sum(axis=1)).flatten()
-                total_counts = np.array(adata.X.sum(axis=1)).flatten()
+                mt_counts = np.asarray(adata.X[:, mt_mask].sum(axis=1)).ravel()
+                total_counts = np.asarray(adata.X.sum(axis=1)).ravel()
             else:
-                mt_mask = np.isin(adata.var_names, mt_genes)
                 mt_counts = adata.X[:, mt_mask].sum(axis=1)
                 total_counts = adata.X.sum(axis=1)
+                if mt_counts.ndim == 2: mt_counts = mt_counts.ravel()
+                if total_counts.ndim == 2: total_counts = total_counts.ravel()
+            total_counts = total_counts.astype(np.float64)
             total_counts[total_counts == 0] = 1
             obs["percent_mt"] = 100 * mt_counts / total_counts
             logger.info(
@@ -1085,9 +1158,13 @@ def process_single_dataset(
     t0 = time.time()
     raw_size_mb = raw_path.stat().st_size / (1024 * 1024)
 
-    # For very large files (>4 GB on disk), use backed mode to inspect first
+    # For very large files (>4 GB on disk), use backed mode to subset genes
+    # BEFORE loading into memory. This prevents OOM when X is stored dense
+    # (e.g. Replogle files: 310K × 8.5K dense ≈ 10.6 GB → 310K × 5.1K ≈ 6.3 GB).
+    precomputed_row_sums = None  # will be passed to preprocess_h5ad if computed here
+
     if raw_size_mb > 4_000 and dataset_name != "cd4t":
-        logger.info(f"  Large file ({raw_size_mb:.0f} MB) — loading with backed='r' for inspection...")
+        logger.info(f"  Large file ({raw_size_mb:.0f} MB) — using backed mode for memory-safe loading...")
         adata_backed = anndata.read_h5ad(str(raw_path), backed='r')
         logger.info(
             f"  Backed shape: {adata_backed.shape[0]:,} cells × {adata_backed.shape[1]:,} genes"
@@ -1095,15 +1172,86 @@ def process_single_dataset(
         logger.info(f"  .obs columns: {list(adata_backed.obs.columns)}")
         logger.info(f"  .var columns: {list(adata_backed.var.columns)}")
 
-        # If we have a gene list, we can determine the column mask early
-        # and only load the needed portion into RAM
-        logger.info("  Loading into memory (sparse)...")
-        adata = adata_backed.to_memory()
+        # --- Early gene name resolution (metadata only, no X access) ---
+        _gene_symbol_col = None
+        if "features" in adata_backed.var.columns:
+            _gene_symbol_col = "features"
+        elif "gene_name" in adata_backed.var.columns:
+            _gene_symbol_col = "gene_name"
+        elif "gene_symbols" in adata_backed.var.columns:
+            _gene_symbol_col = "gene_symbols"
+
+        var_names_resolved = adata_backed.var_names.values
+        if _gene_symbol_col and var_names_resolved[0].startswith("ENS"):
+            var_names_resolved = adata_backed.var[_gene_symbol_col].astype(str).values
+            logger.info(f"  Resolved Ensembl IDs → '{_gene_symbol_col}' for gene matching")
+
+        # --- Determine gene column mask against gene_list ---
+        gene_col_mask = None
+        if gene_list is not None:
+            gene_set = set(gene_list)
+            # Also apply HGNC harmonization to var names for matching
+            hgnc_mapper = fetch_hgnc_mapper(var_names_resolved.tolist())
+            if hgnc_mapper:
+                var_names_harmonized = np.array([hgnc_mapper.get(g, g) for g in var_names_resolved])
+            else:
+                var_names_harmonized = var_names_resolved
+            gene_col_mask = np.isin(var_names_harmonized, list(gene_set))
+            n_match = gene_col_mask.sum()
+            logger.info(f"  Early gene mask: {n_match}/{len(gene_list)} target genes found in dataset")
+
+        # --- Precompute row sums from obs or chunked h5py reads ---
+        # Needed for correct library-size normalization on ALL genes
+        if gene_list is not None:
+            # Try to use existing UMI count from obs (no X access needed)
+            if "UMI_count" in adata_backed.obs.columns:
+                precomputed_row_sums = adata_backed.obs["UMI_count"].values.astype(np.float64)
+                logger.info(f"  Library sizes from obs['UMI_count'] (no X read needed)")
+            elif "nCount_RNA" in adata_backed.obs.columns:
+                precomputed_row_sums = adata_backed.obs["nCount_RNA"].values.astype(np.float64)
+                logger.info(f"  Library sizes from obs['nCount_RNA']")
+            else:
+                # Chunked row-sum computation from h5py to avoid loading full X
+                logger.info(f"  Computing library sizes via chunked reads...")
+                n_cells_b, n_genes_b = adata_backed.shape
+                precomputed_row_sums = np.zeros(n_cells_b, dtype=np.float64)
+                chunk_cols = 500  # ~620 MB per chunk for 310K cells
+                for j_start in range(0, n_genes_b, chunk_cols):
+                    j_end = min(j_start + chunk_cols, n_genes_b)
+                    chunk = adata_backed.X[:, j_start:j_end]
+                    if hasattr(chunk, 'toarray'):
+                        chunk = chunk.toarray()
+                    precomputed_row_sums += chunk.sum(axis=1).ravel().astype(np.float64)
+                logger.info(
+                    f"  ✓ Library sizes computed (median={np.median(precomputed_row_sums):.0f})"
+                )
+
+        # --- Subset genes in backed mode, then load to memory ---
+        backed_subset_done = False
+        if gene_col_mask is not None and gene_col_mask.sum() > 0:
+            logger.info(f"  Subsetting to {gene_col_mask.sum()} genes in backed mode...")
+            try:
+                adata_backed_sub = adata_backed[:, gene_col_mask]
+                logger.info(f"  Loading subset ({adata_backed_sub.shape[1]} genes) into memory...")
+                adata = adata_backed_sub.to_memory()
+                adata_backed_sub = None
+                backed_subset_done = True
+            except Exception as e:
+                logger.warning(f"  ⚠ Backed subset failed ({e}), loading full dataset...")
+                adata = adata_backed.to_memory()
+        else:
+            logger.info("  Loading full dataset into memory...")
+            adata = adata_backed.to_memory()
+
         adata_backed.file.close()
         del adata_backed
         gc.collect()
+
+        # If backed subset succeeded, genes are already filtered → skip in preprocess_h5ad
+        gene_list_for_preprocess = None if backed_subset_done else gene_list
     else:
         adata = anndata.read_h5ad(str(raw_path))
+        gene_list_for_preprocess = gene_list
 
     load_time = time.time() - t0
     logger.info(
@@ -1160,9 +1308,10 @@ def process_single_dataset(
             adata,
             target_sum=10_000,
             log_base=2,
-            gene_list=gene_list,
+            gene_list=gene_list_for_preprocess,
             gene_symbol_col=gene_symbol_col,
             copy=False,
+            precomputed_row_sums=precomputed_row_sums,
         )
         pp_time = time.time() - t0
         logger.info(f"  Preprocessing completed in {pp_time:.1f}s")
@@ -1226,7 +1375,7 @@ def preprocess_existing_file(
     # Save
     if output_path is None:
         stem = filepath.stem.replace("_raw", "").replace("_singlecell", "")
-        output_path = filepath.parent / f"{stem}_processed.h5ad"
+        output_path = PROCESSED_DIR / f"{stem}_processed.h5ad"
     else:
         output_path = Path(output_path)
 
