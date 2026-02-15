@@ -1131,7 +1131,7 @@ def run_multiview_clustering(
     # ==================================================================
 
     save_results(results, genes, output_dir, all_embeddings)
-    plot_cluster_views(results, sim_matrices, genes, output_dir)
+    plot_cluster_views(results, all_embeddings, genes, output_dir)  
 
     # Vocabulary completeness check
     for view_name, emb_dict in all_embeddings.items():
@@ -1211,130 +1211,121 @@ def save_results(
 
 def plot_cluster_views(
     results: dict[str, pd.DataFrame],
-    sim_matrices: dict[str, np.ndarray],
+    all_embeddings: dict[str, dict[str, np.ndarray]],  # CHANGED: Uses embeddings now
     genes: list[str],
     output_dir: str,
     n_neighbors_umap: int = 15,
-    min_dist: float = 0.3,
+    min_dist: float = 0.1,
 ):
     """
     Create a multi-panel figure: one UMAP per view, colored by Leiden cluster.
+    Saves the trained UMAP models for later archetype projection.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import joblib  # For saving models
+    
     try:
         from umap import UMAP
     except ImportError:
-        logger.warning("umap-learn not installed, skipping plot. Install with: pip install umap-learn")
+        logger.warning("umap-learn not installed, skipping plot.")
         return
 
     views = sorted(results.keys())
     n_views = len(views)
-    if n_views == 0:
-        return
+    if n_views == 0: return
+
+    # Create directory for UMAP models
+    model_dir = os.path.join(output_dir, "umap_models")
+    os.makedirs(model_dir, exist_ok=True)
 
     ncols = min(3, n_views)
     nrows = (n_views + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 6 * nrows), dpi=150)
-    if n_views == 1:
-        axes = np.array([axes])
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), dpi=150)
+    if n_views == 1: axes = np.array([axes])
     axes = axes.flatten()
 
     for idx, view_name in enumerate(views):
         ax = axes[idx]
-        sim = sim_matrices[view_name]
         df = results[view_name]
-
-        sim_clipped = np.clip(sim, 0, None)
-        np.fill_diagonal(sim_clipped, 1.0)
-        dist = 1.0 - sim_clipped
-        np.fill_diagonal(dist, 0.0)
-
+        
+        # Get embeddings for this view
+        emb_dict = all_embeddings.get(view_name, {})
+        # Ensure gene order matches dataframe/list
+        valid_genes = [g for g in genes if g in emb_dict]
+        if not valid_genes:
+            ax.text(0.5, 0.5, "No embeddings", ha='center')
+            continue
+            
+        X = np.array([emb_dict[g] for g in valid_genes])
+        
+        # Fit UMAP
+        logger.info(f"[{view_name}] Fitting UMAP on {len(X)} genes...")
         reducer = UMAP(
-            n_neighbors=min(n_neighbors_umap, len(genes) - 1),
+            n_neighbors=min(n_neighbors_umap, len(X) - 1),
             min_dist=min_dist,
-            metric="precomputed",
+            metric="cosine",  # Spectral embeddings work well with Cosine
             random_state=42,
         )
-        coords = reducer.fit_transform(dist)
+        coords = reducer.fit_transform(X)
+        
+        # SAVE THE MODEL
+        model_path = os.path.join(model_dir, f"umap_{view_name}.pkl")
+        joblib.dump(reducer, model_path)
 
-        cluster_labels = df["cluster"].values
+        # Plotting
+        cluster_labels = df.set_index("gene").loc[valid_genes]["cluster"].values
         unique_clusters = sorted(set(cluster_labels))
-        cluster_to_int = {c: i for i, c in enumerate(unique_clusters)}
-        cluster_ints = np.array([cluster_to_int[c] for c in cluster_labels])
-        n_clusters = len(unique_clusters)
-
-        # Identify residual cluster (highest numeric suffix)
-        max_suffix = max(int(c.split("_")[-1]) for c in unique_clusters)
+        
+        # Identify residual
+        max_suffix = -1
+        try:
+            suffixes = [int(c.split("_")[-1]) for c in unique_clusters if "_" in c]
+            if suffixes: max_suffix = max(suffixes)
+        except ValueError: pass
         residual_label = f"{view_name}_{max_suffix}"
+        
         is_residual = cluster_labels == residual_label
-
-        if n_clusters <= 20:
-            base_cmap = plt.cm.tab20
-        else:
-            base_cmap = plt.cm.gist_ncar
-
-        colors = np.array([base_cmap(cluster_ints[i] / max(n_clusters - 1, 1)) for i in range(len(genes))])
-        colors[is_residual] = (0.85, 0.85, 0.85, 1.0)
-
+        
+        # Colors
+        cluster_to_int = {c: i for i, c in enumerate(unique_clusters)}
+        c_ints = np.array([cluster_to_int[c] for c in cluster_labels])
+        
+        if len(unique_clusters) <= 20: cmap = plt.cm.tab20
+        else: cmap = plt.cm.gist_ncar
+        
+        colors = cmap(c_ints / max(len(unique_clusters) - 1, 1))
+        
+        # Plot Residuals (Grey)
         if is_residual.any():
             ax.scatter(
                 coords[is_residual, 0], coords[is_residual, 1],
-                c=[(0.85, 0.85, 0.85, 1.0)],
-                s=4, alpha=0.3, rasterized=True,
+                c='#e0e0e0', s=4, alpha=0.3, rasterized=True
             )
+        
+        # Plot Signal
         ax.scatter(
             coords[~is_residual, 0], coords[~is_residual, 1],
-            c=colors[~is_residual],
-            s=6, alpha=0.7, rasterized=True,
+            c=colors[~is_residual], s=6, alpha=0.7, rasterized=True
         )
 
-        n_real = n_clusters - (1 if is_residual.any() else 0)
-        n_residual = int(is_residual.sum())
-        ax.set_title(f"{view_name}\n{n_real} clusters, {n_residual} residual genes", fontsize=12)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_xlabel("UMAP 1", fontsize=9)
-        ax.set_ylabel("UMAP 2", fontsize=9)
+        n_real = len(unique_clusters) - (1 if is_residual.any() else 0)
+        ax.set_title(f"{view_name}\n{n_real} clusters", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlabel("UMAP 1", fontsize=8)
+        ax.set_ylabel("UMAP 2", fontsize=8)
 
     for idx in range(n_views, len(axes)):
         axes[idx].set_visible(False)
 
-    fig.suptitle("Multi-View Gene Clustering", fontsize=16, y=1.02)
+    fig.suptitle("Multi-View Gene Clustering (Spectral Space)", fontsize=14, y=1.02)
     plt.tight_layout()
 
     plot_path = os.path.join(output_dir, "cluster_views_umap.png")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"Cluster UMAP plot saved to {plot_path}")
-
-    # --- Cluster size distributions ---
-    fig2, axes2 = plt.subplots(1, n_views, figsize=(4 * n_views, 3.5), dpi=150)
-    if n_views == 1:
-        axes2 = [axes2]
-
-    for idx, view_name in enumerate(views):
-        ax = axes2[idx]
-        df = results[view_name]
-        sizes = df["cluster"].value_counts().sort_values(ascending=False)
-
-        max_suffix = max(int(c.split("_")[-1]) for c in sizes.index)
-        residual_label = f"{view_name}_{max_suffix}"
-        bar_colors = ["#cccccc" if label == residual_label else "#4c72b0" for label in sizes.index]
-
-        ax.bar(range(len(sizes)), sizes.values, color=bar_colors, edgecolor="none")
-        ax.set_title(f"{view_name} ({len(sizes)} clusters)", fontsize=11)
-        ax.set_xlabel("Cluster rank", fontsize=9)
-        ax.set_ylabel("# genes", fontsize=9)
-        ax.tick_params(labelsize=8)
-
-    plt.tight_layout()
-    sizes_path = os.path.join(output_dir, "cluster_sizes.png")
-    fig2.savefig(sizes_path, dpi=150, bbox_inches="tight")
-    plt.close(fig2)
-    logger.info(f"Cluster size distribution plot saved to {sizes_path}")
-
+    logger.info(f"Saved plots and UMAP models to {output_dir}")
 
 # =============================================================================
 # 11. CLUSTER ARCHETYPES
@@ -1366,93 +1357,48 @@ def compute_cluster_archetypes(
 ) -> dict[str, dict[str, np.ndarray]]:
     """
     Compute cluster archetype embeddings for every view.
-
-    For each view and each cluster, the archetype is the mean of the spectral
-    embeddings of all genes assigned to that cluster:
-
-        archetype_c = (1 / |C|) * Σ_{g ∈ C} emb(g)
-
-    This gives a single vector per cluster that lives in the same spectral
-    space as the gene embeddings, enabling direct comparison (e.g., inter-
-    cluster distances, nearest-cluster lookup for new genes).
-
-    Reads from a previous pipeline run:
-        {result_dir}/cluster_gene_lists.json
-        {result_dir}/embeddings/gene_emb_{view}.pkl
-
-    Writes:
-        {result_dir}/embeddings/cluster_emb_{view}.pkl
-            dict[str, np.ndarray]  cluster_label → archetype vector
-
-    Parameters
-    ----------
-    result_dir : str, optional
-        Path to the pipeline output directory.
-        If None, defaults to 'gene_clusters_results' next to this script.
-
-    Returns
-    -------
-    dict[str, dict[str, np.ndarray]]
-        view_name → {cluster_label → archetype_vector}
     """
     result_dir = _resolve_result_dir(result_dir)
 
     # --- Load cluster assignments ---
     cluster_json_path = os.path.join(result_dir, "cluster_gene_lists.json")
     if not os.path.exists(cluster_json_path):
-        raise FileNotFoundError(
-            f"cluster_gene_lists.json not found in {result_dir}. "
-            f"Run the 'cluster' subcommand first."
-        )
+        raise FileNotFoundError(f"cluster_gene_lists.json not found in {result_dir}")
 
     with open(cluster_json_path) as f:
-        cluster_gene_lists = json.load(f)  # {view: {cluster_label: [genes]}}
+        cluster_gene_lists = json.load(f)
 
-    logger.info(f"Loaded cluster assignments for {len(cluster_gene_lists)} views from {cluster_json_path}")
+    logger.info(f"Loaded cluster assignments for {len(cluster_gene_lists)} views")
 
     emb_dir = os.path.join(result_dir, "embeddings")
     if not os.path.isdir(emb_dir):
-        raise FileNotFoundError(
-            f"Embeddings directory not found: {emb_dir}. "
-            f"Run the 'cluster' subcommand first (gene embeddings are required)."
-        )
+        raise FileNotFoundError(f"Embeddings directory not found: {emb_dir}")
 
     # --- Compute archetypes per view ---
     all_archetypes = {}
+    all_gene_embeddings = {}  # <--- NEW: Store gene embeddings for plotting
 
     for view_name, clusters in cluster_gene_lists.items():
         emb_path = os.path.join(emb_dir, f"gene_emb_{view_name}.pkl")
         if not os.path.exists(emb_path):
-            logger.warning(f"[{view_name}] Gene embeddings not found at {emb_path}, skipping")
+            logger.warning(f"[{view_name}] Gene embeddings not found, skipping")
             continue
 
-        gene_emb = pickle_load(emb_path)  # dict[str, np.ndarray]
+        gene_emb = pickle_load(emb_path)
+        all_gene_embeddings[view_name] = gene_emb  # <--- Save for plotter
+        
         dim = next(iter(gene_emb.values())).shape[0]
-
         archetypes = {}
+        
         for cluster_label, gene_list in clusters.items():
-            # Collect embeddings for genes in this cluster
             vecs = []
-            missing = 0
             for g in gene_list:
                 if g in gene_emb:
                     vecs.append(gene_emb[g])
-                else:
-                    missing += 1
 
             if not vecs:
-                logger.warning(
-                    f"[{view_name}] Cluster {cluster_label}: no gene embeddings found "
-                    f"({len(gene_list)} genes, all missing). Archetype set to zeros."
-                )
                 archetypes[cluster_label] = np.zeros(dim, dtype=np.float32)
                 continue
-
-            if missing > 0:
-                logger.warning(
-                    f"[{view_name}] Cluster {cluster_label}: {missing}/{len(gene_list)} "
-                    f"genes missing from embeddings, computing archetype from {len(vecs)} genes"
-                )
 
             # Archetype = mean embedding
             archetypes[cluster_label] = np.mean(vecs, axis=0).astype(np.float32)
@@ -1461,27 +1407,198 @@ def compute_cluster_archetypes(
         out_path = os.path.join(emb_dir, f"cluster_emb_{view_name}.pkl")
         pickle_save(archetypes, out_path)
         all_archetypes[view_name] = archetypes
+        
+        logger.info(f"[{view_name}] Computed {len(archetypes)} archetypes")
 
-        logger.info(
-            f"[{view_name}] Computed {len(archetypes)} cluster archetypes (dim={dim}) → {out_path}"
-        )
+    plot_archetypes(all_archetypes, all_gene_embeddings, result_dir)
 
     # --- Summary ---
     logger.info("\nCluster Archetype Summary")
     logger.info("=" * 40)
     for view_name, archetypes in all_archetypes.items():
-        sizes = {k: len(cluster_gene_lists[view_name][k]) for k in archetypes}
-        logger.info(
-            f"  {view_name}: {len(archetypes)} archetypes, "
-            f"cluster sizes: {min(sizes.values())}–{max(sizes.values())} genes"
-        )
+        logger.info(f"  {view_name}: {len(archetypes)} archetypes")
 
     return all_archetypes
 
+def plot_archetypes(
+    all_archetypes: dict[str, dict[str, np.ndarray]],
+    all_gene_embeddings: dict[str, dict[str, np.ndarray]],
+    output_dir: str,
+):
+    """
+    Project cluster archetypes into the SAME UMAP space as the genes
+    by loading the pre-trained UMAP models.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import joblib
+    import numpy as np
+
+    views = sorted(all_archetypes.keys())
+    if not views: return
+
+    model_dir = os.path.join(output_dir, "umap_models")
+    
+    # Grid setup
+    ncols = min(3, len(views))
+    nrows = (len(views) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), dpi=150)
+    if len(views) == 1: axes = np.array([axes])
+    axes = axes.flatten()
+
+    for idx, view_name in enumerate(views):
+        ax = axes[idx]
+        
+        # 1. Load Data
+        archetype_dict = all_archetypes[view_name]
+        gene_emb_dict = all_gene_embeddings.get(view_name, {})
+        
+        if not gene_emb_dict:
+            continue
+
+        # Prepare matrices
+        gene_ids = sorted(gene_emb_dict.keys())
+        gene_matrix = np.array([gene_emb_dict[g] for g in gene_ids])
+        
+        clust_labels = sorted(archetype_dict.keys(), 
+                              key=lambda x: int(x.split('_')[-1]) if '_' in x else x)
+        clust_matrix = np.array([archetype_dict[l] for l in clust_labels])
+
+        # 2. Load UMAP Model or Fallback
+        model_path = os.path.join(model_dir, f"umap_{view_name}.pkl")
+        reducer = None
+        gene_coords = None
+        
+        if os.path.exists(model_path):
+            try:
+                reducer = joblib.load(model_path)
+                # Transform Genes (to reconstruct background)
+                gene_coords = reducer.transform(gene_matrix)
+                # Transform Archetypes
+                clust_coords = reducer.transform(clust_matrix)
+                logger.info(f"[{view_name}] Loaded UMAP model and projected archetypes.")
+            except Exception as e:
+                logger.warning(f"[{view_name}] Failed to load UMAP model: {e}")
+        
+        if reducer is None:
+            logger.warning(f"[{view_name}] Model not found. Fitting fresh UMAP (spaces might drift).")
+            # Fallback: Fit fresh (note: this might not align perfectly with previous plots)
+            try:
+                from umap import UMAP
+                reducer = UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
+                gene_coords = reducer.fit_transform(gene_matrix)
+                clust_coords = reducer.transform(clust_matrix)
+            except ImportError:
+                continue
+
+        # 3. Plotting
+        # Background: Genes
+        ax.scatter(
+            gene_coords[:, 0], gene_coords[:, 1],
+            c='#e0e0e0', s=2, alpha=0.3, rasterized=True, label='Genes'
+        )
+
+        # Foreground: Archetypes
+        # Identify residual
+        max_suffix = -1
+        try:
+            suffixes = [int(l.split("_")[-1]) for l in clust_labels if "_" in l]
+            if suffixes: max_suffix = max(suffixes)
+        except ValueError: pass
+        residual_label = f"{view_name}_{max_suffix}"
+        is_residual = np.array([l == residual_label for l in clust_labels])
+        
+        # Colors
+        n_clusters = len(clust_labels)
+        if n_clusters <= 20: cmap = plt.cm.tab20
+        else: cmap = plt.cm.gist_ncar
+        
+        # Non-Residual
+        non_res = np.where(~is_residual)[0]
+        if len(non_res) > 0:
+            ax.scatter(
+                clust_coords[non_res, 0], clust_coords[non_res, 1],
+                c=non_res, cmap=cmap, 
+                s=200, edgecolors='black', linewidth=1.5, zorder=10
+            )
+            for i in non_res:
+                txt = clust_labels[i].split('_')[-1]
+                ax.text(clust_coords[i, 0], clust_coords[i, 1], txt, 
+                        fontsize=9, ha='center', va='center', 
+                        color='white', fontweight='bold', zorder=11)
+
+        # Residual
+        res = np.where(is_residual)[0]
+        if len(res) > 0:
+            ax.scatter(
+                clust_coords[res, 0], clust_coords[res, 1],
+                c='#555555', marker='X', s=150, edgecolors='white', zorder=10
+            )
+
+        ax.set_title(f"{view_name}", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    for idx in range(len(views), len(axes)):
+        axes[idx].set_visible(False)
+
+    fig.suptitle("Cluster Archetypes (Projected)", fontsize=14, y=1.02)
+    plt.tight_layout()
+    
+    out_path = os.path.join(output_dir, "archetypes_overlay_umap.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 # =============================================================================
 # 12. CLI
 # =============================================================================
+
+def regenerate_plots(result_dir: Optional[str] = None):
+    """
+    Regenerate plots from existing results without re-running clustering.
+    """
+    result_dir = _resolve_result_dir(result_dir)
+    logger.info(f"Regenerating plots from: {result_dir}")
+    
+    # 1. Load Cluster Assignments
+    cluster_csv = os.path.join(result_dir, "clusters_all_views.csv")
+    if not os.path.exists(cluster_csv):
+        raise FileNotFoundError(f"Clusters file not found: {cluster_csv}")
+    
+    df_all = pd.read_csv(cluster_csv)
+    genes = df_all["gene"].tolist()
+    
+    # Reconstruct 'results' dict
+    results = {}
+    for col in df_all.columns:
+        if col == "gene": continue
+        results[col] = df_all[["gene", col]].rename(columns={col: "cluster"})
+        
+    # 2. Load Gene Embeddings
+    emb_dir = os.path.join(result_dir, "embeddings")
+    all_embeddings = {}
+    
+    # Scan for embedding files
+    import glob
+    emb_files = glob.glob(os.path.join(emb_dir, "gene_emb_*.pkl"))
+    for fpath in emb_files:
+        view_name = os.path.basename(fpath).replace("gene_emb_", "").replace(".pkl", "")
+        all_embeddings[view_name] = pickle_load(fpath)
+        
+    if not all_embeddings:
+        raise FileNotFoundError(f"No gene embeddings found in {emb_dir}")
+
+    # 3. Plot Gene Views (This will re-save UMAP models)
+    logger.info("Plotting Gene Views...")
+    plot_cluster_views(results, all_embeddings, genes, result_dir)
+    
+    # 4. Compute/Load Archetypes (for the overlay plot)
+    # We call compute_cluster_archetypes, which now handles plotting internally
+    # and will use the UMAP models we just saved in step 3.
+    logger.info("Computing Archetypes & Plotting Overlay...")
+    compute_cluster_archetypes(result_dir)
+    
+    logger.info("Done.")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1548,6 +1665,19 @@ Examples:
     )
 
     # ------------------------------------------------------------------
+    # Subcommand: plot
+    # ------------------------------------------------------------------
+    p_plot = subparsers.add_parser(
+        "plot",
+        help="Regenerate plots from existing results",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_plot.add_argument(
+        "--result-dir", default=None,
+        help="Path to result directory (default: 'gene_clusters_results' next to script)"
+    )
+
+    # ------------------------------------------------------------------
     # Parse & dispatch
     # ------------------------------------------------------------------
     args = parser.parse_args()
@@ -1578,7 +1708,9 @@ Examples:
 
     elif args.command == "archetypes":
         compute_cluster_archetypes(result_dir=args.result_dir)
-
+    
+    elif args.command == "plot":
+        regenerate_plots(result_dir=args.result_dir)
 
 if __name__ == "__main__":
   """
