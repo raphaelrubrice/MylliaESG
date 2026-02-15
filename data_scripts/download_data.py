@@ -39,6 +39,8 @@ Author: MylliaESG project
 
 import argparse
 import logging
+import json
+import requests
 import os
 import subprocess
 import sys
@@ -79,7 +81,7 @@ DATASET_REGISTRY = {
         "download_type": "figshare",
         # Figshare ndownloader link for K562_essential_raw_singlecell_01.h5ad
         # Update this URL from: https://plus.figshare.com/articles/dataset/20029387
-        "url": "https://plus.figshare.com/ndownloader/files/35773219",
+        "url": "https://plus.figshare.com/ndownloader/files/35773075",
         "filename": "K562_essential_raw_singlecell_01.h5ad",
         "obs_perturbation_col": "gene",          # column containing perturbation gene symbol
         "obs_control_value": "non-targeting",     # value indicating control cells
@@ -92,7 +94,7 @@ DATASET_REGISTRY = {
         "cell_type": "RPE1",
         "role": "eval",
         "download_type": "figshare",
-        "url": "https://plus.figshare.com/ndownloader/files/35773207",
+        "url": "https://plus.figshare.com/ndownloader/files/35775606",
         "filename": "rpe1_raw_singlecell_01.h5ad",
         "obs_perturbation_col": "gene",
         "obs_control_value": "non-targeting",
@@ -107,7 +109,7 @@ DATASET_REGISTRY = {
         "download_type": "zenodo",
         # Update from TRADE repo / Zenodo: https://pmc.ncbi.nlm.nih.gov/articles/PMC11244993/
         # Look for the Zenodo DOI in the Data Availability section
-        "url": "ZENODO_URL_PLACEHOLDER",
+        "url": "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE264667&format=file&file=GSE264667%5Fjurkat%5Fraw%5Fsinglecell%5F01%2Eh5ad",
         "filename": "jurkat_essential_raw.h5ad",
         "obs_perturbation_col": "gene",
         "obs_control_value": "non-targeting",
@@ -120,7 +122,7 @@ DATASET_REGISTRY = {
         "cell_type": "HepG2",
         "role": "eval",
         "download_type": "zenodo",
-        "url": "ZENODO_URL_PLACEHOLDER",
+        "url": "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE264667&format=file&file=GSE264667%5Fhepg2%5Fraw%5Fsinglecell%5F01%2Eh5ad",
         "filename": "hepg2_essential_raw.h5ad",
         "obs_perturbation_col": "gene",
         "obs_control_value": "non-targeting",
@@ -708,60 +710,237 @@ def download_nadig(dataset_name: str, config: dict, raw_dir: Path) -> Optional[P
     return dest if success else None
 
 
+# def download_cd4t(dataset_name: str, config: dict, raw_dir: Path) -> Optional[Path]:
+#     """
+#     Download CD4+ T cell data from CZI Virtual Cells Platform.
+
+#     This dataset is large (~22M cells). We download and immediately filter to:
+#       - Stim8hr condition only
+#       - 1-2 donors
+#     to keep it manageable.
+
+#     NOTE: CZI data access may require their Python SDK. If the direct URL doesn't
+#     work, you may need to:
+#       1. pip install cellxgene-census
+#       2. Use the API to download the specific slice
+#     """
+#     logger.info(f"{'=' * 60}")
+#     logger.info(f"Downloading {config['description']}")
+#     logger.info(f"{'=' * 60}")
+
+#     dest = raw_dir / config["filename"]
+
+#     if dest.exists():
+#         size_mb = dest.stat().st_size / (1024 * 1024)
+#         logger.info(f"  File already exists: {dest} ({size_mb:.1f} MB)")
+#         return dest
+
+#     logger.info(
+#         "  CD4+ T cell data is hosted on the CZI Virtual Cells Platform.\n"
+#         "  This may require the cellxgene-census SDK or manual download.\n"
+#         f"  URL: {config['url']}\n"
+#         "\n"
+#         "  Option 1 — Manual download:\n"
+#         f"    Download the Stim8hr AnnData from the CZI platform and place at:\n"
+#         f"      {dest}\n"
+#         "\n"
+#         "  Option 2 — cellxgene-census SDK:\n"
+#         "    pip install cellxgene-census\n"
+#         "    Then use the filtering API to get Stim8hr + 2 donors."
+#     )
+
+#     # Attempt SDK-based download
+#     try:
+#         logger.info("  Attempting cellxgene-census SDK download...")
+#         import cellxgene_census
+
+#         # This is a template — the exact API calls depend on how the dataset
+#         # is organized on the platform. Adjust as needed.
+#         logger.warning(
+#             "  cellxgene-census SDK found but automated download for this specific "
+#             "dataset requires dataset-specific code. Please download manually."
+#         )
+#         return None
+
+#     except ImportError:
+#         logger.info("  cellxgene-census not installed. Manual download required.")
+#         return None
+
 def download_cd4t(dataset_name: str, config: dict, raw_dir: Path) -> Optional[Path]:
     """
-    Download CD4+ T cell data from CZI Virtual Cells Platform.
+    Download CD4+ T cell data using CZI VCP CLI and immediately filter.
 
-    This dataset is large (~22M cells). We download and immediately filter to:
-      - Stim8hr condition only
-      - 1-2 donors
-    to keep it manageable.
-
-    NOTE: CZI data access may require their Python SDK. If the direct URL doesn't
-    work, you may need to:
-      1. pip install cellxgene-census
-      2. Use the API to download the specific slice
+    This function:
+      1. Searches for the dataset using 'vcp'.
+      2. Downloads the raw file (prioritizing a 'Stim8hr' subset if available) to a temp file.
+      3. Loads the temp file (backed mode) and applies filters:
+         - Condition = Stim8hr
+         - Donors = First 2 donors
+      4. Saves the filtered subset to the final destination and deletes the temp file.
     """
+    import shutil
+    import subprocess
+    import anndata
+
     logger.info(f"{'=' * 60}")
     logger.info(f"Downloading {config['description']}")
     logger.info(f"{'=' * 60}")
 
     dest = raw_dir / config["filename"]
 
+    # 1. Check if final file already exists
     if dest.exists():
         size_mb = dest.stat().st_size / (1024 * 1024)
         logger.info(f"  File already exists: {dest} ({size_mb:.1f} MB)")
         return dest
 
-    logger.info(
-        "  CD4+ T cell data is hosted on the CZI Virtual Cells Platform.\n"
-        "  This may require the cellxgene-census SDK or manual download.\n"
-        f"  URL: {config['url']}\n"
-        "\n"
-        "  Option 1 — Manual download:\n"
-        f"    Download the Stim8hr AnnData from the CZI platform and place at:\n"
-        f"      {dest}\n"
-        "\n"
-        "  Option 2 — cellxgene-census SDK:\n"
-        "    pip install cellxgene-census\n"
-        "    Then use the filtering API to get Stim8hr + 2 donors."
-    )
-
-    # Attempt SDK-based download
-    try:
-        logger.info("  Attempting cellxgene-census SDK download...")
-        import cellxgene_census
-
-        # This is a template — the exact API calls depend on how the dataset
-        # is organized on the platform. Adjust as needed.
-        logger.warning(
-            "  cellxgene-census SDK found but automated download for this specific "
-            "dataset requires dataset-specific code. Please download manually."
-        )
+    # 2. Check for VCP CLI
+    if not shutil.which("vcp"):
+        logger.error("  ✗ 'vcp' CLI tool not found. Please install it and log in.")
         return None
 
-    except ImportError:
-        logger.info("  cellxgene-census not installed. Manual download required.")
+    temp_path = None
+
+    try:
+        # 3. Find the Dataset ID
+        search_term = "Primary Human CD4+ T Cell Perturb-seq"
+        logger.info(f"  Searching VCP for: '{search_term}'...")
+        
+        cmd_search = ["vcp", "data", "search", search_term, "--exact"]
+        result = subprocess.run(cmd_search, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logger.error(f"  ✗ Search failed: {result.stderr}")
+            return None
+
+        # Parse output to find ID (First column of output)
+        dataset_id = None
+        lines = result.stdout.strip().split('\n')
+        # Skip header if present, look for the line containing the name
+        for line in lines:
+            if search_term in line:
+                dataset_id = line.split()[0]
+                break
+        
+        if not dataset_id:
+            # Fallback: try taking the first non-header line if search was exact
+            if len(lines) > 1 and "ID" in lines[0]:
+                 dataset_id = lines[1].split()[0]
+            elif len(lines) > 0 and "ID" not in lines[0]:
+                 dataset_id = lines[0].split()[0]
+
+        if not dataset_id:
+            logger.error("  ✗ Could not determine dataset ID from search results.")
+            return None
+
+        logger.info(f"  Found Dataset ID: {dataset_id}")
+
+        # 4. List files to find the .h5ad
+        logger.info("  Listing files in dataset...")
+        cmd_list = ["vcp", "data", "list-files", dataset_id]
+        list_res = subprocess.run(cmd_list, capture_output=True, text=True)
+        
+        if list_res.returncode != 0:
+            logger.error(f"  ✗ Failed to list files: {list_res.stderr}")
+            return None
+
+        # Identify target file. Prefer "Stim8hr" if available to save bandwidth.
+        # Otherwise download the main file.
+        files = [l.split()[0] for l in list_res.stdout.strip().split('\n') if ".h5ad" in l]
+        
+        target_file_name = None
+        stim_files = [f for f in files if "Stim8hr" in f]
+        
+        if stim_files:
+            target_file_name = stim_files[0]
+            logger.info(f"  Found pre-split file: {target_file_name}")
+        elif files:
+            target_file_name = files[0]
+            logger.info(f"  No pre-split file found. Downloading main file: {target_file_name}")
+        else:
+            logger.error("  ✗ No .h5ad file found in dataset.")
+            return None
+
+        # 5. Download to a temporary location
+        # Use a temp name in the raw directory
+        temp_path = raw_dir / f"temp_{target_file_name}"
+        
+        logger.info(f"  Downloading to temporary file {temp_path}...")
+        
+        cmd_download = [
+            "vcp", "data", "download", 
+            dataset_id, 
+            target_file_name, 
+            "--output", str(raw_dir)
+        ]
+        
+        subprocess.run(cmd_download, check=True, capture_output=True)
+        
+        # The CLI downloads to <output_dir>/<filename>. Rename to our temp path if needed.
+        downloaded_original_path = raw_dir / target_file_name
+        if downloaded_original_path.exists() and downloaded_original_path != temp_path:
+            downloaded_original_path.rename(temp_path)
+            
+        if not temp_path.exists():
+            logger.error("  ✗ Download appeared to succeed but temp file is missing.")
+            return None
+
+        # 6. Load and Filter (The original requirement)
+        logger.info("  Processing and filtering data (Stim8hr + 2 Donors)...")
+        
+        # Use backed='r' to avoid loading 22M cells into RAM if we got the full file
+        adata = anndata.read_h5ad(temp_path, backed='r')
+        
+        # --- Filter Condition (Stim8hr) ---
+        cond_col = config.get("condition_col", "condition")
+        cond_val = config.get("condition_value", "Stim8hr")
+        
+        if cond_col in adata.obs.columns:
+            # Case-insensitive match check
+            # Note: In backed mode, boolean indexing is efficient
+            mask_cond = adata.obs[cond_col] == cond_val
+            if mask_cond.sum() == 0:
+                 # Try approximate match
+                 mask_cond = adata.obs[cond_col].astype(str).str.lower() == cond_val.lower()
+            
+            if mask_cond.sum() > 0:
+                adata = adata[mask_cond]
+                logger.info(f"    Filter condition '{cond_val}': kept {adata.shape[0]:,} cells")
+            else:
+                logger.warning(f"    Condition '{cond_val}' not found. Keeping all cells.")
+        
+        # --- Filter Donors ---
+        donor_col = config.get("obs_batch_col", "donor")
+        n_donors = config.get("donor_subset", 2)
+        
+        if donor_col in adata.obs.columns:
+            # We need to compute unique donors. 
+            # In backed mode, accessing unique() on a column is usually fine.
+            donors = sorted(adata.obs[donor_col].unique())
+            if len(donors) > n_donors:
+                selected_donors = donors[:n_donors]
+                mask_donor = adata.obs[donor_col].isin(selected_donors)
+                adata = adata[mask_donor]
+                logger.info(f"    Filter donors {selected_donors}: kept {adata.shape[0]:,} cells")
+        
+        # 7. Save filtered file
+        logger.info(f"  Saving filtered dataset to {dest}...")
+        # Write triggers the actual data read/write from the backed file
+        adata.write_h5ad(dest)
+        
+        # 8. Cleanup
+        logger.info("  Cleaning up temporary files...")
+        temp_path.unlink()
+        
+        size_mb = dest.stat().st_size / (1024 * 1024)
+        logger.info(f"  ✓ Process complete: {dest} ({size_mb:.1f} MB)")
+        return dest
+
+    except Exception as e:
+        logger.error(f"  ✗ Failed during download/filtering: {e}")
+        # Attempt cleanup
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
         return None
 
 

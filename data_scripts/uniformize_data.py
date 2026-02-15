@@ -539,7 +539,7 @@ def assign_splits(
           * Controls: assigned to eval3 (they serve as reference for all evals)
     """
     if rng is None:
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(1234)
 
     obs = adata.obs
     splits = pd.Series("unassigned", index=obs.index)
@@ -943,8 +943,8 @@ Examples:
         help="Fraction of training cells held out for eval1 (default: 0.2)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducible subsampling and splits (default: 42)",
+        "--seed", type=int, default=1234,
+        help="Random seed for reproducible subsampling and splits (default: 1234)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",

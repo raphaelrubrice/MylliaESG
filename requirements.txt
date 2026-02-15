@@ -14,3 +14,6 @@ anndata>=0.10
 fair-esm>=2.0
 torch>=2.0
 mygene>=3.2
+
+# Virtual Cell Platform biohup
+vcp-cli
