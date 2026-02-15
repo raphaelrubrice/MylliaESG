@@ -172,17 +172,21 @@ def preprocess_h5ad(
     log_base: int = 2,
     gene_list: Optional[list[str]] = None,
     gene_symbol_col: Optional[str] = None,
-    copy: bool = True,
+    copy: bool = False,
 ) -> "anndata.AnnData":
     """
     Universal preprocessing pipeline for raw count AnnData.
 
+    Memory-efficient: operates entirely on sparse matrices, never densifies.
+    Library-size normalization is computed on ALL genes before subsetting,
+    ensuring correctness regardless of when gene filtering occurs.
+
     Steps:
-        1. Ensure we're working with raw counts (detect if already normalized)
-        2. Per-cell library-size normalization (divide by total UMI)
-        3. Scale to target_sum (default 10,000)
-        4. log2(x + 1) transformation
-        5. Optionally subset to a gene list
+        1. Compute per-cell library size on full gene set (sparse row sums)
+        2. Subset to gene list early (reduces memory footprint)
+        3. Per-cell library-size normalization → scale to target_sum
+        4. log2(x + 1) transformation (sparse-safe: zeros stay zero)
+        5. Store raw counts in .layers["raw_counts"]
 
     Parameters
     ----------
@@ -193,11 +197,11 @@ def preprocess_h5ad(
     log_base : int
         Log base for transformation (2 for log2, use 0 for natural log)
     gene_list : list[str], optional
-        If provided, subset to these genes after normalization.
+        If provided, subset to these genes (after computing library size on all genes).
     gene_symbol_col : str, optional
         Column in .var containing gene symbols. If None, uses .var_names.
     copy : bool
-        If True, operate on a copy.
+        If True, operate on a copy. Default False to save memory.
 
     Returns
     -------
@@ -212,64 +216,43 @@ def preprocess_h5ad(
     n_cells, n_genes = adata.shape
     logger.info(f"Preprocessing: {n_cells:,} cells × {n_genes:,} genes")
 
-    # --- Step 0: Store raw counts ---
-    if sparse.issparse(adata.X):
-        X = adata.X.toarray().astype(np.float32)
-    else:
-        X = np.array(adata.X, dtype=np.float32)
+    # Ensure sparse CSR format
+    if not sparse.issparse(adata.X):
+        logger.info("  Converting dense matrix to sparse CSR...")
+        adata.X = sparse.csr_matrix(adata.X, dtype=np.float32)
+    elif adata.X.dtype != np.float32:
+        adata.X = adata.X.astype(np.float32)
 
-    # Sanity check: detect if already normalized
-    row_sums = X.sum(axis=1)
+    # --- Step 0: Sanity checks (sparse-safe, no densification) ---
+    row_sums = np.asarray(adata.X.sum(axis=1)).ravel()
     min_sum, max_sum = row_sums.min(), row_sums.max()
     median_sum = np.median(row_sums)
     logger.info(
         f"  UMI counts per cell: min={min_sum:.0f}, median={median_sum:.0f}, max={max_sum:.0f}"
     )
 
-    # If values are very small or uniform, warn about possible pre-normalization
     if median_sum < 100:
         logger.warning(
             "  ⚠ Median UMI count is very low (<100). Data may already be normalized "
             "or log-transformed. Proceeding anyway — verify your input."
         )
-    if np.any(X < 0):
+    # Check for negatives using sparse .data array (only stored values)
+    if adata.X.data.size > 0 and np.any(adata.X.data < 0):
         logger.warning("  ⚠ Negative values detected. Data may already be log-transformed.")
-    if np.allclose(row_sums, row_sums[0], rtol=1e-3):
+    if len(row_sums) > 1 and np.allclose(row_sums, row_sums[0], rtol=1e-3):
         logger.warning(
             "  ⚠ All cells have near-identical total counts — data may already be "
             "library-size normalized."
         )
 
-    # Store raw counts before transformation
-    adata.layers["raw_counts"] = sparse.csr_matrix(X.copy())
-    logger.info("  Stored raw counts in .layers['raw_counts']")
+    # --- Step 1: Compute library-size scaling on ALL genes BEFORE subsetting ---
+    # This preserves correctness: normalization factors reflect the full transcriptome.
+    cell_totals = row_sums.copy()
+    cell_totals[cell_totals == 0] = 1.0
+    scaling_factors = (target_sum / cell_totals).astype(np.float32)
 
-    # --- Step 1: Per-cell library-size normalization ---
-    cell_totals = X.sum(axis=1, keepdims=True)
-    cell_totals[cell_totals == 0] = 1.0  # avoid division by zero for empty cells
-    X = X / cell_totals
-    logger.info("  Per-cell library-size normalization done")
-
-    # --- Step 2: Scale to target_sum ---
-    X = X * target_sum
-    logger.info(f"  Scaled to target_sum={target_sum:,.0f}")
-
-    # --- Step 3: Log transformation ---
-    if log_base == 2:
-        X = np.log2(X + 1)
-        logger.info("  Applied log2(x + 1)")
-    elif log_base == 0:
-        X = np.log1p(X)  # natural log
-        logger.info("  Applied ln(x + 1)")
-    else:
-        X = np.log(X + 1) / np.log(log_base)
-        logger.info(f"  Applied log{log_base}(x + 1)")
-
-    adata.X = sparse.csr_matrix(X)
-
-    # --- Step 4: Gene subsetting ---
+    # --- Step 2: Subset genes EARLY to reduce memory for downstream ops ---
     if gene_list is not None:
-        # Resolve gene symbols
         if gene_symbol_col and gene_symbol_col in adata.var.columns:
             var_genes = adata.var[gene_symbol_col].values
         else:
@@ -283,26 +266,58 @@ def preprocess_h5ad(
             f"  Gene list subsetting: {len(available)}/{len(gene_list)} genes found "
             f"({len(missing)} missing from this dataset)"
         )
-        if len(missing) > 0 and len(missing) <= 20:
+        if 0 < len(missing) <= 20:
             logger.info(f"    Missing genes: {sorted(missing)}")
         elif len(missing) > 20:
             logger.info(f"    First 20 missing: {sorted(missing)[:20]} ...")
 
-        # Subset
-        mask = np.isin(var_genes, list(gene_set))
-        adata = adata[:, mask].copy()
+        col_mask = np.isin(var_genes, list(gene_set))
+        adata = adata[:, col_mask]
+        # Use copy only on the now-smaller matrix to defragment memory
+        adata = adata.copy()
         logger.info(f"  After subsetting: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes")
 
-    # --- Final stats ---
-    if sparse.issparse(adata.X):
-        Xd = adata.X.toarray()
+    # --- Step 3: Store raw counts AFTER gene subset (much smaller) ---
+    adata.layers["raw_counts"] = adata.X.copy()
+    logger.info("  Stored raw counts in .layers['raw_counts']")
+
+    # --- Step 4: Library-size normalize + scale (sparse row-scaling) ---
+    # Multiply each row i by scaling_factors[i] using a diagonal matrix.
+    # This is memory-efficient: creates a new sparse matrix with same sparsity.
+    X_norm = sparse.diags(scaling_factors).dot(adata.X)
+    if not sparse.isspmatrix_csr(X_norm):
+        X_norm = X_norm.tocsr()
+    logger.info(f"  Per-cell library-size normalization + scale to {target_sum:,.0f} done")
+
+    # --- Step 5: Log transformation (in-place on sparse .data) ---
+    # log(0 + 1) = 0, so zero entries are correct by omission in sparse format.
+    # We only need to transform the explicitly stored non-zero values.
+    X_norm = X_norm.copy()  # ensure we own the data array
+    if log_base == 2:
+        X_norm.data = np.log2(X_norm.data + 1)
+        logger.info("  Applied log2(x + 1)")
+    elif log_base == 0:
+        X_norm.data = np.log1p(X_norm.data)
+        logger.info("  Applied ln(x + 1)")
     else:
-        Xd = adata.X
-    logger.info(
-        f"  Normalized expression stats: "
-        f"min={Xd.min():.3f}, mean={Xd.mean():.3f}, max={Xd.max():.3f}, "
-        f"sparsity={100 * (Xd == 0).mean():.1f}%"
-    )
+        X_norm.data = np.log(X_norm.data + 1) / np.log(log_base)
+        logger.info(f"  Applied log{log_base}(x + 1)")
+
+    adata.X = X_norm
+
+    # --- Final stats (sparse-safe: sample or use .data array) ---
+    nnz = adata.X.nnz
+    total_elements = adata.shape[0] * adata.shape[1]
+    sparsity = 100.0 * (1.0 - nnz / total_elements) if total_elements > 0 else 0.0
+    data_vals = adata.X.data
+    if data_vals.size > 0:
+        logger.info(
+            f"  Normalized expression stats (non-zero values): "
+            f"min={data_vals.min():.3f}, mean={data_vals.mean():.3f}, max={data_vals.max():.3f}, "
+            f"sparsity={sparsity:.1f}%"
+        )
+    else:
+        logger.info(f"  All values are zero (sparsity=100%)")
 
     return adata
 
@@ -755,77 +770,22 @@ def download_nadig(dataset_name: str, config: dict, raw_dir: Path) -> Optional[P
     return dest if success else None
 
 
-# def download_cd4t(dataset_name: str, config: dict, raw_dir: Path) -> Optional[Path]:
-#     """
-#     Download CD4+ T cell data from CZI Virtual Cells Platform.
-
-#     This dataset is large (~22M cells). We download and immediately filter to:
-#       - Stim8hr condition only
-#       - 1-2 donors
-#     to keep it manageable.
-
-#     NOTE: CZI data access may require their Python SDK. If the direct URL doesn't
-#     work, you may need to:
-#       1. pip install cellxgene-census
-#       2. Use the API to download the specific slice
-#     """
-#     logger.info(f"{'=' * 60}")
-#     logger.info(f"Downloading {config['description']}")
-#     logger.info(f"{'=' * 60}")
-
-#     dest = raw_dir / config["filename"]
-
-#     if dest.exists():
-#         size_mb = dest.stat().st_size / (1024 * 1024)
-#         logger.info(f"  File already exists: {dest} ({size_mb:.1f} MB)")
-#         return dest
-
-#     logger.info(
-#         "  CD4+ T cell data is hosted on the CZI Virtual Cells Platform.\n"
-#         "  This may require the cellxgene-census SDK or manual download.\n"
-#         f"  URL: {config['url']}\n"
-#         "\n"
-#         "  Option 1 — Manual download:\n"
-#         f"    Download the Stim8hr AnnData from the CZI platform and place at:\n"
-#         f"      {dest}\n"
-#         "\n"
-#         "  Option 2 — cellxgene-census SDK:\n"
-#         "    pip install cellxgene-census\n"
-#         "    Then use the filtering API to get Stim8hr + 2 donors."
-#     )
-
-#     # Attempt SDK-based download
-#     try:
-#         logger.info("  Attempting cellxgene-census SDK download...")
-#         import cellxgene_census
-
-#         # This is a template — the exact API calls depend on how the dataset
-#         # is organized on the platform. Adjust as needed.
-#         logger.warning(
-#             "  cellxgene-census SDK found but automated download for this specific "
-#             "dataset requires dataset-specific code. Please download manually."
-#         )
-#         return None
-
-#     except ImportError:
-#         logger.info("  cellxgene-census not installed. Manual download required.")
-#         return None
-
 def download_cd4t(dataset_name: str, config: dict, raw_dir: Path) -> Optional[Path]:
     """
-    Download CD4+ T cell data using CZI VCP CLI and immediately filter.
-
-    This function:
-      1. Searches for the dataset using 'vcp'.
-      2. Downloads the raw file (prioritizing a 'Stim8hr' subset if available) to a temp file.
-      3. Loads the temp file (backed mode) and applies filters:
-         - Condition = Stim8hr
-         - Donors = First 2 donors
-      4. Saves the filtered subset to the final destination and deletes the temp file.
+    Download and merge CD4+ T cell data for donors D1 and D4 (Stim8Hr).
+    
+    OPTIMIZED: Uses on-disk concatenation to avoid OOM errors.
     """
     import shutil
     import subprocess
     import anndata
+    # Check for on-disk concatenation support (anndata >= 0.9)
+    try:
+        from anndata.experimental import concat_on_disk
+    except ImportError:
+        logger.error("  ✗ Your version of anndata is too old for low-memory merging.")
+        logger.error("    Please upgrade: pip install anndata>=0.9")
+        return None
 
     logger.info(f"{'=' * 60}")
     logger.info(f"Downloading {config['description']}")
@@ -844,148 +804,112 @@ def download_cd4t(dataset_name: str, config: dict, raw_dir: Path) -> Optional[Pa
         logger.error("  ✗ 'vcp' CLI tool not found. Please install it and log in.")
         return None
 
-    temp_path = None
+    # Keep track of paths and IDs for successful downloads
+    dataset_paths = []
+    successful_ids = []
+    temp_dirs = []
 
     try:
-        # 3. Find the Dataset ID
-        search_term = "Primary Human CD4+ T Cell Perturb-seq"
-        logger.info(f"  Searching VCP for: '{search_term}'...")
+        # 3. Search for the specific D1/D4 Stim8Hr datasets
+        search_query = 'Primary Human CD4+ T Cell Perturb-seq (D1 OR D4) AND Stim8Hr'
+        logger.info(f"  Searching VCP for: '{search_query}'...")
         
-        cmd_search = ["vcp", "data", "search", search_term, "--exact"]
+        cmd_search = ["vcp", "data", "search", search_query]
         result = subprocess.run(cmd_search, capture_output=True, text=True)
         
         if result.returncode != 0:
             logger.error(f"  ✗ Search failed: {result.stderr}")
             return None
 
-        # Parse output to find ID (First column of output)
-        dataset_id = None
+        # Parse output to find IDs
+        dataset_ids = []
         lines = result.stdout.strip().split('\n')
-        # Skip header if present, look for the line containing the name
         for line in lines:
-            if search_term in line:
-                dataset_id = line.split()[0]
-                break
-        
-        if not dataset_id:
-            # Fallback: try taking the first non-header line if search was exact
-            if len(lines) > 1 and "ID" in lines[0]:
-                 dataset_id = lines[1].split()[0]
-            elif len(lines) > 0 and "ID" not in lines[0]:
-                 dataset_id = lines[0].split()[0]
+            line = line.strip()
+            if line.startswith('│') and "Dataset ID" not in line:
+                parts = line.split('│')
+                if len(parts) > 1:
+                    d_id = parts[1].strip()
+                    if len(d_id) > 10:
+                        dataset_ids.append(d_id)
 
-        if not dataset_id:
-            logger.error("  ✗ Could not determine dataset ID from search results.")
+        if not dataset_ids:
+            logger.error("  ✗ No dataset IDs found in search results.")
             return None
 
-        logger.info(f"  Found Dataset ID: {dataset_id}")
+        logger.info(f"  Found {len(dataset_ids)} datasets. IDs: {dataset_ids}")
 
-        # 4. List files to find the .h5ad
-        logger.info("  Listing files in dataset...")
-        cmd_list = ["vcp", "data", "list-files", dataset_id]
-        list_res = subprocess.run(cmd_list, capture_output=True, text=True)
-        
-        if list_res.returncode != 0:
-            logger.error(f"  ✗ Failed to list files: {list_res.stderr}")
-            return None
+        # 4. Download (but DO NOT LOAD) each dataset
+        for d_id in dataset_ids:
+            current_temp_dir = raw_dir / f"temp_dl_{d_id}"
+            current_temp_dir.mkdir(exist_ok=True)
+            temp_dirs.append(current_temp_dir)
 
-        # Identify target file. Prefer "Stim8hr" if available to save bandwidth.
-        # Otherwise download the main file.
-        files = [l.split()[0] for l in list_res.stdout.strip().split('\n') if ".h5ad" in l]
-        
-        target_file_name = None
-        stim_files = [f for f in files if "Stim8hr" in f]
-        
-        if stim_files:
-            target_file_name = stim_files[0]
-            logger.info(f"  Found pre-split file: {target_file_name}")
-        elif files:
-            target_file_name = files[0]
-            logger.info(f"  No pre-split file found. Downloading main file: {target_file_name}")
-        else:
-            logger.error("  ✗ No .h5ad file found in dataset.")
-            return None
-
-        # 5. Download to a temporary location
-        # Use a temp name in the raw directory
-        temp_path = raw_dir / f"temp_{target_file_name}"
-        
-        logger.info(f"  Downloading to temporary file {temp_path}...")
-        
-        cmd_download = [
-            "vcp", "data", "download", 
-            dataset_id, 
-            target_file_name, 
-            "--output", str(raw_dir)
-        ]
-        
-        subprocess.run(cmd_download, check=True, capture_output=True)
-        
-        # The CLI downloads to <output_dir>/<filename>. Rename to our temp path if needed.
-        downloaded_original_path = raw_dir / target_file_name
-        if downloaded_original_path.exists() and downloaded_original_path != temp_path:
-            downloaded_original_path.rename(temp_path)
+            logger.info(f"  Downloading dataset {d_id}...")
             
-        if not temp_path.exists():
-            logger.error("  ✗ Download appeared to succeed but temp file is missing.")
+            cmd_download = [
+                "vcp", "data", "download", 
+                "--id", d_id, 
+                "-o", str(current_temp_dir)
+            ]
+            
+            dl_proc = subprocess.run(
+                cmd_download, 
+                input="Y\n", 
+                text=True, 
+                capture_output=True
+            )
+
+            if dl_proc.returncode != 0:
+                logger.error(f"  ✗ Download failed for {d_id}: {dl_proc.stderr}")
+                continue
+
+            # Find the .h5ad file
+            downloaded_files = list(current_temp_dir.glob("*.h5ad"))
+            
+            if not downloaded_files:
+                logger.error(f"  ✗ No .h5ad file found after download for {d_id}")
+                continue
+
+            target_file = downloaded_files[0]
+            logger.info(f"    ✓ Downloaded: {target_file.name}")
+            
+            # Store path and ID, but do not read into RAM
+            dataset_paths.append(str(target_file))
+            successful_ids.append(d_id)
+
+        # 5. Merge Data on Disk
+        if not dataset_paths:
+            logger.error("  ✗ No data was successfully downloaded.")
             return None
 
-        # 6. Load and Filter (The original requirement)
-        logger.info("  Processing and filtering data (Stim8hr + 2 Donors)...")
+        logger.info(f"  Merging {len(dataset_paths)} datasets on disk (Low RAM mode)...")
         
-        # Use backed='r' to avoid loading 22M cells into RAM if we got the full file
-        adata = anndata.read_h5ad(temp_path, backed='r')
+        # This function performs the merge without loading files into memory
+        concat_on_disk(
+            dataset_paths,
+            str(dest),
+            join="outer",     # Keep all genes (union)
+            label="batch",    # Create 'batch' column in .obs
+            keys=successful_ids # Populate 'batch' column with IDs
+        )
         
-        # --- Filter Condition (Stim8hr) ---
-        cond_col = config.get("condition_col", "condition")
-        cond_val = config.get("condition_value", "Stim8hr")
-        
-        if cond_col in adata.obs.columns:
-            # Case-insensitive match check
-            # Note: In backed mode, boolean indexing is efficient
-            mask_cond = adata.obs[cond_col] == cond_val
-            if mask_cond.sum() == 0:
-                 # Try approximate match
-                 mask_cond = adata.obs[cond_col].astype(str).str.lower() == cond_val.lower()
-            
-            if mask_cond.sum() > 0:
-                adata = adata[mask_cond]
-                logger.info(f"    Filter condition '{cond_val}': kept {adata.shape[0]:,} cells")
-            else:
-                logger.warning(f"    Condition '{cond_val}' not found. Keeping all cells.")
-        
-        # --- Filter Donors ---
-        donor_col = config.get("obs_batch_col", "donor")
-        n_donors = config.get("donor_subset", 2)
-        
-        if donor_col in adata.obs.columns:
-            # We need to compute unique donors. 
-            # In backed mode, accessing unique() on a column is usually fine.
-            donors = sorted(adata.obs[donor_col].unique())
-            if len(donors) > n_donors:
-                selected_donors = donors[:n_donors]
-                mask_donor = adata.obs[donor_col].isin(selected_donors)
-                adata = adata[mask_donor]
-                logger.info(f"    Filter donors {selected_donors}: kept {adata.shape[0]:,} cells")
-        
-        # 7. Save filtered file
-        logger.info(f"  Saving filtered dataset to {dest}...")
-        # Write triggers the actual data read/write from the backed file
-        adata.write_h5ad(dest)
-        
-        # 8. Cleanup
-        logger.info("  Cleaning up temporary files...")
-        temp_path.unlink()
+        # 6. Cleanup
+        logger.info("  Cleaning up temporary directories...")
+        for t_dir in temp_dirs:
+            if t_dir.exists():
+                shutil.rmtree(t_dir)
         
         size_mb = dest.stat().st_size / (1024 * 1024)
         logger.info(f"  ✓ Process complete: {dest} ({size_mb:.1f} MB)")
         return dest
 
     except Exception as e:
-        logger.error(f"  ✗ Failed during download/filtering: {e}")
+        logger.error(f"  ✗ Failed during download/processing: {e}")
         # Attempt cleanup
-        if temp_path and temp_path.exists():
-            temp_path.unlink()
+        for t_dir in temp_dirs:
+            if t_dir.exists():
+                shutil.rmtree(t_dir)
         return None
 
 
@@ -1041,41 +965,59 @@ DOWNLOADERS = {
 def filter_cd4t_stim8hr(adata, config: dict, n_donors: int = 2):
     """
     Filter CD4+ T cell data to Stim8hr condition and subset of donors.
-    """
-    import anndata
 
+    NOTE: If using the updated download_cd4t(), the downloaded file is already
+    filtered to Stim8hr for D1+D4. This function will detect that and skip
+    redundant filtering. It still runs safely as a no-op guard.
+
+    Memory-efficient: builds a single boolean mask and applies it once,
+    avoiding intermediate .copy() calls on large data.
+    """
+    n_before = adata.shape[0]
+    mask = np.ones(n_before, dtype=bool)
+
+    # --- Condition filter ---
     cond_col = config.get("condition_col", "condition")
     cond_val = config.get("condition_value", "Stim8hr")
-
-    logger.info(f"  Filtering CD4+ T cells: condition={cond_val}")
 
     if cond_col in adata.obs.columns:
         conditions = adata.obs[cond_col].unique()
         logger.info(f"    Available conditions: {list(conditions)}")
 
-        mask = adata.obs[cond_col] == cond_val
-        if mask.sum() == 0:
-            # Try case-insensitive match
-            mask = adata.obs[cond_col].str.lower() == cond_val.lower()
-
-        if mask.sum() == 0:
-            logger.warning(f"    Condition '{cond_val}' not found! Using all cells.")
+        if len(conditions) == 1 and conditions[0].lower() == cond_val.lower():
+            logger.info(f"    Already filtered to {cond_val} (single condition). Skipping.")
         else:
-            adata = adata[mask].copy()
-            logger.info(f"    After condition filter: {adata.shape[0]:,} cells")
-    else:
-        logger.warning(f"    Condition column '{cond_col}' not found in .obs")
+            cond_mask = adata.obs[cond_col] == cond_val
+            if cond_mask.sum() == 0:
+                cond_mask = adata.obs[cond_col].str.lower() == cond_val.lower()
 
-    # Donor subsetting
+            if cond_mask.sum() == 0:
+                logger.warning(f"    Condition '{cond_val}' not found! Keeping all cells.")
+            else:
+                mask &= cond_mask.values
+                logger.info(f"    Condition filter '{cond_val}': {mask.sum():,}/{n_before:,} cells pass")
+    else:
+        logger.info(f"    Condition column '{cond_col}' not in .obs — assuming pre-filtered.")
+
+    # --- Donor filter ---
     donor_col = config.get("obs_batch_col", "donor")
     if donor_col in adata.obs.columns and n_donors:
         donors = sorted(adata.obs[donor_col].unique())
         logger.info(f"    Available donors: {donors}")
         if len(donors) > n_donors:
             selected = donors[:n_donors]
-            mask = adata.obs[donor_col].isin(selected)
-            adata = adata[mask].copy()
-            logger.info(f"    Selected donors {selected}: {adata.shape[0]:,} cells")
+            mask &= adata.obs[donor_col].isin(selected).values
+            logger.info(f"    Selected donors {selected}: {mask.sum():,} cells pass")
+        else:
+            logger.info(f"    {len(donors)} donors ≤ requested {n_donors}. Keeping all.")
+
+    # --- Apply combined mask in one shot ---
+    n_keep = mask.sum()
+    if n_keep < n_before:
+        adata = adata[mask].copy()
+        logger.info(f"  Filtered CD4+ T: {n_before:,} → {n_keep:,} cells")
+    else:
+        logger.info(f"  No filtering needed: all {n_before:,} cells retained")
 
     return adata
 
@@ -1093,8 +1035,18 @@ def process_single_dataset(
     """
     Download (if needed) and preprocess a single dataset.
     Returns the path to the processed .h5ad, or None on failure.
+
+    Memory-efficient pipeline:
+      1. Download raw data
+      2. Load .h5ad (sparse, or backed for very large files)
+      3. Cell-level filtering (CD4T condition/donor) — combined mask, single .copy()
+      4. Gene symbol harmonization
+      5. Metadata tagging (sparse-safe)
+      6. Preprocessing: lib-size norm (full genes) → gene subset → scale → log (all sparse)
+      7. Save processed file, free memory
     """
     import anndata
+    import gc
 
     if dataset_name not in DATASET_REGISTRY:
         logger.error(f"Unknown dataset: {dataset_name}")
@@ -1131,7 +1083,28 @@ def process_single_dataset(
     # --- Load ---
     logger.info(f"\nLoading {raw_path}...")
     t0 = time.time()
-    adata = anndata.read_h5ad(str(raw_path))
+    raw_size_mb = raw_path.stat().st_size / (1024 * 1024)
+
+    # For very large files (>4 GB on disk), use backed mode to inspect first
+    if raw_size_mb > 4_000 and dataset_name != "cd4t":
+        logger.info(f"  Large file ({raw_size_mb:.0f} MB) — loading with backed='r' for inspection...")
+        adata_backed = anndata.read_h5ad(str(raw_path), backed='r')
+        logger.info(
+            f"  Backed shape: {adata_backed.shape[0]:,} cells × {adata_backed.shape[1]:,} genes"
+        )
+        logger.info(f"  .obs columns: {list(adata_backed.obs.columns)}")
+        logger.info(f"  .var columns: {list(adata_backed.var.columns)}")
+
+        # If we have a gene list, we can determine the column mask early
+        # and only load the needed portion into RAM
+        logger.info("  Loading into memory (sparse)...")
+        adata = adata_backed.to_memory()
+        adata_backed.file.close()
+        del adata_backed
+        gc.collect()
+    else:
+        adata = anndata.read_h5ad(str(raw_path))
+
     load_time = time.time() - t0
     logger.info(
         f"  Loaded: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes "
@@ -1142,7 +1115,9 @@ def process_single_dataset(
 
     # --- CD4+ T special filtering ---
     if dataset_name == "cd4t":
+        logger.info("\nFiltering CD4+ T cells...")
         adata = filter_cd4t_stim8hr(adata, config)
+        gc.collect()
 
     # --- Gene symbol harmonization ---
     logger.info("\nHarmonizing gene symbols...")
@@ -1166,12 +1141,16 @@ def process_single_dataset(
     logger.info("\nStandardizing metadata...")
     adata = load_and_tag_metadata(adata, config, dataset_name)
 
-    # --- Harmonize perturbation gene symbols too ---
+    # --- Harmonize perturbation gene symbols using same HGNC mapper ---
     pert_col = "perturbation"
     if pert_col in adata.obs.columns:
-        adata.obs[pert_col] = adata.obs[pert_col].map(
-            lambda x: GENE_SYMBOL_ALIASES.get(x, x)
-        )
+        pert_symbols = adata.obs[pert_col].unique().tolist()
+        pert_mapper = fetch_hgnc_mapper(pert_symbols)
+        if pert_mapper:
+            adata.obs[pert_col] = adata.obs[pert_col].map(
+                lambda x: pert_mapper.get(x, x)
+            )
+            logger.info(f"  Harmonized {len(pert_mapper)} perturbation gene symbols")
 
     # --- Preprocess ---
     if do_preprocess:
@@ -1208,6 +1187,10 @@ def process_single_dataset(
     logger.info(f"  Output:        {processed_path}")
     logger.info(f"{'─' * 50}")
 
+    # Free memory before returning
+    del adata
+    gc.collect()
+
     return processed_path
 
 
@@ -1218,8 +1201,10 @@ def preprocess_existing_file(
 ) -> Optional[Path]:
     """
     Apply the preprocessing pipeline to any existing .h5ad file.
+    Memory-efficient: uses sparse operations throughout.
     """
     import anndata
+    import gc
 
     filepath = Path(filepath)
     if not filepath.exists():
@@ -1233,7 +1218,7 @@ def preprocess_existing_file(
     # Harmonize
     adata = harmonize_gene_symbols(adata)
 
-    # Preprocess
+    # Preprocess (sparse-safe, copy=False)
     adata = preprocess_h5ad(
         adata, target_sum=10_000, log_base=2, gene_list=gene_list, copy=False,
     )
@@ -1247,6 +1232,10 @@ def preprocess_existing_file(
 
     adata.write_h5ad(str(output_path))
     logger.info(f"  ✓ Saved to {output_path}")
+
+    del adata
+    gc.collect()
+
     return output_path
 
 

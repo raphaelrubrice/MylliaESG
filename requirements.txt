@@ -16,4 +16,4 @@ torch>=2.0
 mygene>=3.2
 
 # Virtual Cell Platform biohup
-vcp-cli
+vcp-cli[data]
