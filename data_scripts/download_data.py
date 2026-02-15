@@ -461,12 +461,17 @@ def harmonize_gene_symbols(adata, gene_symbol_col: Optional[str] = None) -> "ann
 # ============================================================================
 # DOWNLOAD HELPERS
 # ============================================================================
-
+    
 def download_file(url: str, dest: Path, desc: str = "") -> bool:
     """
-    Download a file using wget (with retry) or fallback to Python requests.
+    Download a file using Figshare API (if detected), wget, or Python requests.
     Returns True on success.
     """
+    import requests
+    import re
+    import subprocess
+
+    # 1. Check for placeholders
     if url.startswith("ZENODO_URL_PLACEHOLDER") or url.startswith("CZI_URL_PLACEHOLDER"):
         logger.error(
             f"  ✗ URL placeholder detected for {desc}. "
@@ -475,6 +480,7 @@ def download_file(url: str, dest: Path, desc: str = "") -> bool:
         logger.error(f"    See the docstring at the top of this file for guidance.")
         return False
 
+    # 2. Setup destination
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists():
@@ -485,6 +491,46 @@ def download_file(url: str, dest: Path, desc: str = "") -> bool:
     logger.info(f"  Downloading {desc or url}")
     logger.info(f"    → {dest}")
 
+    # 3. Handle Figshare URLs specifically (using the working API endpoint)
+    if "figshare" in url:
+        # Extract ID from https://.../files/12345678
+        match = re.search(r"files/(\d+)", url)
+        if match:
+            file_id = match.group(1)
+            # The direct download endpoint you found
+            api_url = f"https://api.figshare.com/v2/file/download/{file_id}"
+            logger.info(f"  Detected Figshare ID {file_id}. Using API: {api_url}")
+
+            try:
+                # stream=True is critical for large files (prevents RAM OOM)
+                with requests.get(api_url, stream=True, timeout=120) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get('content-length', 0))
+
+                    with open(dest, "wb") as f:
+                        downloaded = 0
+                        last_report = 0
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            # Log progress every 10%
+                            if total_size > 0 and downloaded - last_report > total_size * 0.1:
+                                pct = 100 * downloaded / total_size
+                                logger.info(f"    Progress: {pct:.0f}% ({downloaded / 1e6:.0f} MB)")
+                                last_report = downloaded
+                
+                size_mb = dest.stat().st_size / (1024 * 1024)
+                logger.info(f"  ✓ Downloaded ({size_mb:.1f} MB)")
+                return True
+
+            except Exception as e:
+                logger.error(f"  ✗ Figshare API download failed: {e}")
+                if dest.exists(): dest.unlink()
+                return False
+        else:
+            logger.warning("  Could not extract Figshare ID. Falling back to standard methods.")
+
+    # 4. Standard Fallback (wget -> requests)
     # Try wget first (better for large files, shows progress)
     try:
         cmd = [
@@ -505,21 +551,20 @@ def download_file(url: str, dest: Path, desc: str = "") -> bool:
 
     # Python fallback
     try:
-        import requests
-        resp = requests.get(url, stream=True, timeout=120)
-        resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
+        with requests.get(url, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
 
-        downloaded = 0
-        last_report = 0
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total > 0 and downloaded - last_report > total * 0.1:
-                    pct = 100 * downloaded / total
-                    logger.info(f"    Progress: {pct:.0f}% ({downloaded / 1e6:.0f} MB)")
-                    last_report = downloaded
+            downloaded = 0
+            last_report = 0
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0 and downloaded - last_report > total * 0.1:
+                        pct = 100 * downloaded / total
+                        logger.info(f"    Progress: {pct:.0f}% ({downloaded / 1e6:.0f} MB)")
+                        last_report = downloaded
 
         size_mb = dest.stat().st_size / (1024 * 1024)
         logger.info(f"  ✓ Downloaded ({size_mb:.1f} MB)")
@@ -1057,7 +1102,7 @@ def process_single_dataset(
         return None
 
     config = DATASET_REGISTRY[dataset_name]
-    logger.info(f"\n{'#' * 70}")
+    logger.info(f"{'#' * 70}")
     logger.info(f"# DATASET: {dataset_name.upper()} — {config['description']}")
     logger.info(f"{'#' * 70}\n")
 
